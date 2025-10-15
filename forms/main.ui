@@ -1,0 +1,516 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>Dialog</class>
+ <widget class="QDialog" name="Dialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1163</width>
+    <height>600</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Urban Change Detection Aid</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <widget class="QTabWidget" name="tabWidget">
+     <property name="currentIndex">
+      <number>8</number>
+     </property>
+     <widget class="QWidget" name="tabInput">
+      <attribute name="title">
+       <string>Input Images</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_1">
+       <item>
+        <widget class="QLabel" name="label">
+         <property name="text">
+          <string>Select Year 1 Image:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QComboBox" name="comboYear1"/>
+       </item>
+       <item>
+        <widget class="QPushButton" name="browseYear1">
+         <property name="text">
+          <string>Browse...</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="georefYear1">
+         <property name="text">
+          <string>Georeference</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="label_2">
+         <property name="text">
+          <string>Select Year 2 Image:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QComboBox" name="comboYear2"/>
+       </item>
+       <item>
+        <widget class="QPushButton" name="browseYear2">
+         <property name="text">
+          <string>Browse...</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="georefYear2">
+         <property name="text">
+          <string>Georeference</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="nextToAlignment">
+         <property name="text">
+          <string>Next</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="btnRefreshLayers">
+         <property name="text">
+          <string>Refresh Project Layers</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tabAlignment">
+      <attribute name="title">
+       <string>Alignment &amp; Crop</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_2">
+       <item>
+        <widget class="QPushButton" name="checkImageDimensions">
+         <property name="text">
+          <string>Check Image Dimensions</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="labelImageInfo">
+         <property name="text">
+          <string>Image Info:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="btnSuggestSize">
+         <property name="text">
+          <string>Suggest Crop Size</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="groupCropSettings">
+         <property name="title">
+          <string>Crop Settings</string>
+         </property>
+         <layout class="QVBoxLayout" name="verticalLayout_crop">
+          <item>
+           <widget class="QRadioButton" name="radioCentroidCrop">
+            <property name="text">
+             <string>Auto Crop by Overlap Centroid</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QRadioButton" name="radioManualCrop">
+            <property name="text">
+             <string>Manual Crop (using overlap area)</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="labelCropWidth">
+            <property name="text">
+             <string>Crop Width:</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QSpinBox" name="spinCropWidth">
+            <property name="maximum">
+             <number>99999</number>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="labelCropHeight">
+            <property name="text">
+             <string>Crop Height:</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QSpinBox" name="spinCropHeight">
+            <property name="maximum">
+             <number>99999</number>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="chkMaintainResolution">
+            <property name="text">
+             <string>Maintain Original Resolution (No Resampling)</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="labelCropInfo">
+            <property name="text">
+             <string>Specify pixel dimensions; may cause resampling.</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="btnApplyCrop">
+         <property name="text">
+          <string>Apply Crop</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="nextToBand">
+         <property name="text">
+          <string>Next</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tabBand">
+      <attribute name="title">
+       <string>Band Extraction &amp; Normalization</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_3">
+       <item>
+        <widget class="QLabel" name="labelBandIndex">
+         <property name="text">
+          <string>Band Index to Extract:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QSpinBox" name="spinBandIndex"/>
+       </item>
+       <item>
+        <widget class="QPushButton" name="extractBand">
+         <property name="text">
+          <string>Extract Band</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="normalizeContrast">
+         <property name="text">
+          <string>Normalize Contrast (2% stretch)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="extractNormalizeReset">
+         <property name="text">
+          <string>Extract &amp; Normalize (with Reset)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="nextToBinarization">
+         <property name="text">
+          <string>Next</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tabBinarization">
+      <attribute name="title">
+       <string>Binarization</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_4">
+       <item>
+        <widget class="QLabel" name="label_7">
+         <property name="text">
+          <string>Threshold Year 1:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QSpinBox" name="spinThresholdYear1">
+         <property name="maximum">
+          <number>255</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="label_8">
+         <property name="text">
+          <string>Threshold Year 2:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QSpinBox" name="spinThresholdYear2">
+         <property name="maximum">
+          <number>255</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="binarizeButton">
+         <property name="text">
+          <string>Binarize Images</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="openHistogramButton">
+         <property name="text">
+          <string>Open Histogram</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="nextToSieve">
+         <property name="text">
+          <string>Next</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tabSieve">
+      <attribute name="title">
+       <string>Sieve Filtering (Optional)</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_sieve">
+       <item>
+        <widget class="QCheckBox" name="chkApplySieve">
+         <property name="text">
+          <string>Apply Sieve</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="labelSieveThreshold">
+         <property name="text">
+          <string>Sieve Threshold (pixels):</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QSpinBox" name="spinSieveThreshold">
+         <property name="minimum">
+          <number>1</number>
+         </property>
+         <property name="maximum">
+          <number>1000</number>
+         </property>
+         <property name="value">
+          <number>10</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="applySieveButton">
+         <property name="text">
+          <string>Apply Sieve</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="next_to_diff">
+         <property name="text">
+          <string>Next</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tabDifference">
+      <attribute name="title">
+       <string>Difference Calculation</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_5">
+       <item>
+        <widget class="QPushButton" name="calculateDifference">
+         <property name="text">
+          <string>Calculate Difference (Year 2 - Year 1)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="next_to_gain_loss">
+         <property name="text">
+          <string>Next</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tabMasks">
+      <attribute name="title">
+       <string>Gain &amp; Loss Masks</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_6">
+       <item>
+        <widget class="QPushButton" name="generateMasks">
+         <property name="text">
+          <string>Generate Gain &amp; Loss Masks</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="applySieveMasksButton">
+         <property name="text">
+          <string>Apply Sieve (Gain/Loss)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="nextToVector">
+         <property name="text">
+          <string>Next</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tabVectorization">
+      <attribute name="title">
+       <string>Vectorization</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_7">
+       <item>
+        <widget class="QPushButton" name="vectorization_export">
+         <property name="text">
+          <string>Vectorize &amp; Orthogonalize</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="previewVectors">
+         <property name="text">
+          <string>Preview Vectors</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="btnReprojectUTM">
+         <property name="text">
+          <string>Reproject to UTM</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="next_to_metrics">
+         <property name="text">
+          <string>Next</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tabMetrics">
+      <attribute name="title">
+       <string>Metrics &amp; Filtering</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_8">
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout">
+         <item>
+          <widget class="QPushButton" name="calculateMetricsAndFilter">
+           <property name="maximumSize">
+            <size>
+             <width>16777215</width>
+             <height>16777215</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>Calculate Metrics and Filter</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_3">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <item>
+          <widget class="QPushButton" name="previewFilteredButton">
+           <property name="text">
+            <string>Preview Filtered Vectors</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QPushButton" name="nextToCentroids">
+         <property name="text">
+          <string>Next</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tabCentroids">
+      <attribute name="title">
+       <string>Centroids &amp; Export</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_9">
+       <item>
+        <widget class="QPushButton" name="generate_centroids">
+         <property name="text">
+          <string>Generate Centroids</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="export_all">
+         <property name="text">
+          <string>Export All Results</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="resetButton">
+         <property name="text">
+          <string>Reset Plugin State</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+   <item>
+    <widget class="QTextEdit" name="logTextEdit"/>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
