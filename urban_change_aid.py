@@ -1,6 +1,6 @@
 from PyQt5.QtCore import QTimer  # Adicione isso no top, após imports Qt
 from PyQt5.QtWidgets import (QLabel, QTabWidget, QWidget, QVBoxLayout,
-                             QHBoxLayout, QSlider, QSpinBox, QDoubleSpinBox, QPushButton, QDialog)
+                             QHBoxLayout, QSlider, QSpinBox, QDoubleSpinBox, QPushButton, QDialog, QGridLayout, QScrollArea)
 from PyQt5 import uic
 from qgis.PyQt.QtWidgets import QApplication
 from datetime import datetime
@@ -373,6 +373,16 @@ class UrbanChangeAid:
         else:
             self.log_message(
                 "Warning: calculateMetricsAndFilter not found in UI. Please check main.ui.")
+
+        if hasattr(self.dialog, 'previewFilteredButton'):
+            self.dialog.previewFilteredButton.clicked.connect(
+                self.open_filtered_preview)
+        elif hasattr(self.dialog, 'buttonPreviewFilteredVectors'):
+            self.dialog.buttonPreviewFilteredVectors.clicked.connect(
+                self.open_filtered_preview)
+        else:
+            self.log_message(
+                "⚠️ Nenhum botão 'Preview' encontrado no UI — verifique o objectName no main.ui")
 
         # Conexões existentes pros sliders (você já tem isso, só pra contexto)
         if hasattr(self.dialog, 'sliderArea'):
@@ -2123,7 +2133,7 @@ class UrbanChangeAid:
                 self.log_message(
                     f"Dynamic range for {field}: {min_val} to {max_val}")
 
-                # Ajusta slider (0 a algo amplo, tipo 10x o max pra dar folga)
+                # Ajusta slider (0 a algo amplo, tipo 10x o max pra
                 # Folga de 50% pra não cortar
                 slider_max = int(max_val * 1.5) if max_val > 0 else 1000
                 spin_max = max_val * 2  # Spin mais generoso
@@ -2395,23 +2405,42 @@ class UrbanChangeAid:
         """Abre janela auxiliar de filtro interativo de métricas (Área, Perímetro, Elongação, Retangularidade)
         aplicada sobre as camadas 'Gain Vectors (with Metrics)' e 'Loss Vectors (with Metrics)'.
         """
+        self.log_message(
+            "🔍 Button clicked: Starting open_filtered_preview...")  # ← NOVO: Confirma clique
 
         gain_layers = QgsProject.instance().mapLayersByName("Gain Vectors (with Metrics)")
         loss_layers = QgsProject.instance().mapLayersByName("Loss Vectors (with Metrics)")
+        self.log_message(
+            f"Found {len(gain_layers)} gain layers and {len(loss_layers)} loss layers.")
 
         if not (gain_layers or loss_layers):
-            QMessageBox.warning(self.dialog, "Warning",
-                                "No metric layers available (Gain/Loss).")
+            self.log_message("No metric layers found - aborting preview.")
+            QMessageBox.warning(
+                self.dialog, "Warning", "No metric layers available (Gain/Loss). Run 'Calculate Metrics and Filter' first.")
             return
 
         gain_layer = gain_layers[0] if gain_layers else None
         loss_layer = loss_layers[0] if loss_layers else None
+
+        # Ativa modo de edição automático nas layers (como no UTM)
+        if gain_layer and gain_layer.isValid():
+            gain_layer.startEditing()
+            self.log_message("✅ Gain layer entered edit mode.")
+        if loss_layer and loss_layer.isValid():
+            loss_layer.startEditing()
+            self.log_message("✅ Loss layer entered edit mode.")
+
+        # ← NOVO: Antes de criar dlg
+        self.log_message("📦 Creating main dialog...")
 
         # === Cria janela principal
         dlg = QDialog(self.dialog)
         dlg.setWindowTitle("Metrics Filter Preview")
         dlg.resize(1000, 900)
         main_layout = QVBoxLayout(dlg)
+
+        # ← NOVO: Confirma criação
+        self.log_message("✅ Dialog created and resized.")
 
         # ===============================
         # BLOCO GAIN
@@ -2426,13 +2455,19 @@ class UrbanChangeAid:
         gain_layout.addWidget(gain_canvas)
 
         # ---- Sliders / Spins ----
-        def metric_slider(label, minv, maxv, step, scale=1.0, decimals=2):
+        def metric_slider(label, minv, maxv, step, scale=1.0, decimals=2, unit="", is_min=True):
             """
             Cria um controle horizontal composto por QLabel + QSlider + QDoubleSpinBox,
             permitindo valores decimais de forma sincronizada.
+            + Novo: Label com min/max e unidade.
             """
             box = QHBoxLayout()
             lbl = QLabel(label)
+
+            # ← NOVO: Label com min/max e unidade
+            range_lbl = QLabel(f"[{minv} - {maxv}] {unit}")
+            # Pequeno e cinza pra não poluir
+            range_lbl.setStyleSheet("QLabel { color: gray; font-size: 9px; }")
 
             # Slider sempre em inteiros (escala aplicada)
             sld = QSlider(Qt.Horizontal)
@@ -2448,6 +2483,7 @@ class UrbanChangeAid:
             spn.setValue(minv)
 
             box.addWidget(lbl)
+            box.addWidget(range_lbl)  # ← NOVO: Adiciona o range label
             box.addWidget(sld)
             box.addWidget(spn)
 
@@ -2553,6 +2589,53 @@ class UrbanChangeAid:
             if not layer or not layer.isValid():
                 QMessageBox.warning(dlg, "Warning", "Layer invalid.")
                 return
+
+            # Verifica se os campos necessários existem
+            required_fields = ['area', 'perimeter',
+                               'elongation', 'rectang', 'is_valid', 'val']
+            existing_fields = [f.name() for f in layer.fields()]
+            missing_fields = [
+                f for f in required_fields if f not in existing_fields]
+            if missing_fields:
+                # Limita pra não flood
+                self.log_message(
+                    f"❌ Missing fields in layer: {missing_fields}. Available: {existing_fields[:5]}...")
+                QMessageBox.warning(
+                    dlg, "Warning", f"Missing fields: {', '.join(missing_fields)}. Run 'Calculate Metrics' first.")
+                return
+
+            # ← CORRIGIDO: Log de diagnóstico - total de features e amostra de atributos
+            total_feats = layer.featureCount()
+            self.log_message(
+                f"📊 Layer diagnostics: Total features = {total_feats}")
+            if total_feats > 0:
+                # Pega as primeiras 3 features iterando (sem slicing no iterator)
+                sample_feats = []
+                it = layer.getFeatures()
+                for i in range(3):
+                    f = next(it, None)
+                    if f:
+                        sample_feats.append(f)
+                    else:
+                        break
+                for i, feat in enumerate(sample_feats):
+                    attrs = {f.name(): feat[f.name()] for f in layer.fields(
+                    ) if f.name() in required_fields}
+                    self.log_message(f"   Sample feature {i+1}: {attrs}")
+            else:
+                self.log_message("⚠️ Layer has NO features at all!")
+                QMessageBox.warning(
+                    dlg, "Warning", "Layer has no features. Check vectorization step.")
+                return
+
+            # ← NOVO: Teste simples sem métricas - só is_valid e val
+            simple_expr = f'"is_valid" = 1 AND "val" = {255 if is_gain else 0}'
+            layer.selectByExpression(simple_expr)
+            simple_sel = layer.selectedFeatureCount()
+            self.log_message(
+                f"🔍 Simple test (is_valid=1 AND val={255 if is_gain else 0}): {simple_sel} selected")
+            layer.removeSelection()  # Limpa pra filtro completo
+
             try:
                 # lê valores conforme tipo
                 min_a = slider_area_g.value() if is_gain else slider_area_l.value()
@@ -2561,63 +2644,134 @@ class UrbanChangeAid:
                          if is_gain else slider_el_l.value()) / 10.0
                 min_r = (slider_rec_g.value()
                          if is_gain else slider_rec_l.value()) / 100.0
-                expression = (
-                    f'"area">={min_a:.4f} AND "perimeter">={min_p:.4f} AND '
-                    f'"elongation"<={max_e:.4f} AND "rectang">={min_r:.4f} AND "is_valid"=1 '
-                    f'AND "val" = {255 if is_gain else 0}'
-                )
+                val_condition = 255 if is_gain else 0
+
+                # ← MUDANÇA: Expressão menos rígida - usa OR para condições opcionais se sliders em default (0/min)
+                # Se todos sliders em min/default, ignora métricas e usa só is_valid + val
+                # Defaults corrigidos (Max Elo=500/10=50)
+                if min_a == 0 and min_p == 0 and max_e == 50.0 and min_r == 0.0:
+                    expression = f'"is_valid" = 1 AND "val" = {val_condition}'
+                    self.log_message(
+                        "💡 Using relaxed filter (all valid + val match, ignoring metrics)")
+                else:
+                    # AND normal, mas com OR interno pra não travar (ex.: (area OR perimeter) mas mantendo essencial)
+                    # Pra simplificar: Agrupa métricas em OR opcional, mas mantém is_valid/val como AND
+                    metrics_part = (
+                        f'("area" >= {min_a} OR "perimeter" >= {min_p} OR "elongation" <= {max_e} OR "rectang" >= {min_r})'
+                    )
+                    expression = f'{metrics_part} AND "is_valid" = 1 AND "val" = {val_condition}'
+                    self.log_message(
+                        "💡 Using OR-based metrics filter (less rigid)")
+
+                # ← NOVO: Log da expressão exata
+                self.log_message(f"🔍 Applying expression: {expression}")
+
                 layer.removeSelection()
                 layer.selectByExpression(expression)
                 sel = layer.selectedFeatureCount()
                 self.log_message(
-                    f"[{'Gain' if is_gain else 'Loss'}] Filter applied: {expression} → {sel} selected")
+                    f"[{'Gain' if is_gain else 'Loss'}] Filter applied → {sel} selected features")
+
                 if sel > 0:
                     canvas.setLayers([layer])
                     canvas.zoomToSelected()
                     canvas.refresh()
-            except Exception as e:
-                self.log_message(f"Error applying filter: {e}")
-
-            def export_selection(layer, out_path):
-                if not layer or not layer.selectedFeatureCount():
-                    QMessageBox.warning(
-                        dlg, "Warning", "No features selected to export.")
-                    return
-                try:
-                    QgsVectorFileWriter.writeAsVectorFormat(
-                        layer, out_path, "UTF-8", driverName="ESRI Shapefile", onlySelected=True)
-                    self.log_message(f"Exported selection to {out_path}")
+                    self.log_message(
+                        f"✅ Zoomed to {sel} selected features on canvas.")
+                    # Força destaque visual (opcional, mas garante)
+                    # Amarelo semi-transparente
+                    canvas.setSelectionColor(QColor(255, 255, 0, 200))
+                else:
+                    self.log_message(
+                        "⚠️ No features matched the filter. Try loosening sliders.")
                     QMessageBox.information(
-                        dlg, "Export", f"Selection exported:\n{out_path}")
-                except Exception as e:
-                    QMessageBox.warning(dlg, "Error", str(e))
-                    self.log_message(f"Export failed: {e}")
-
-            # === conecta ações
-            gain_btn_apply.clicked.connect(
-                lambda: apply_filter(gain_layer, gain_canvas, True))
-            loss_btn_apply.clicked.connect(
-                lambda: apply_filter(loss_layer, loss_canvas, False))
-            gain_btn_export.clicked.connect(lambda: export_selection(
-                gain_layer, os.path.join(self.temp_dir, "gain_filtered.shp")))
-            loss_btn_export.clicked.connect(lambda: export_selection(
-                loss_layer, os.path.join(self.temp_dir, "loss_filtered.shp")))
-
-            # === popula canvas inicial com segurança
-            try:
-                if gain_layer and gain_layer.isValid():
-                    gain_canvas.setLayers([gain_layer])
-                    gain_canvas.setExtent(gain_layer.extent())
-                    gain_canvas.refresh()
-                if loss_layer and loss_layer.isValid():
-                    loss_canvas.setLayers([loss_layer])
-                    loss_canvas.setExtent(loss_layer.extent())
-                    loss_canvas.refresh()
+                        dlg, "Info", "No features selected. Adjust sliders and try again.")
             except Exception as e:
-                self.log_message(f"Error initializing preview canvases: {e}")
+                self.log_message(f"❌ Error applying filter: {e}")
+                import traceback
+                # ← NOVO: Stack trace pra debug
+                self.log_message(traceback.format_exc())
 
-            # Exibe a janela de filtro interativo
-            dlg.exec_()
+        # ← CORRIGIDO: Movido para fora de apply_filter (indentação corrigida)
+        def export_selection(layer, out_path):
+            if not layer or not layer.selectedFeatureCount():
+                QMessageBox.warning(
+                    dlg, "Warning", "No features selected to export.")
+                return
+            try:
+                # Salva o shapefile filtrado
+                QgsVectorFileWriter.writeAsVectorFormat(
+                    layer, out_path, "UTF-8", driverName="ESRI Shapefile", onlySelected=True)
+                self.log_message(f"Exported selection to {out_path}")
+                QMessageBox.information(
+                    dlg, "Export", f"Selection exported:\n{out_path}")
+
+                # ← NOVO: Carrega a layer no projeto QGIS automaticamente
+                layer_name = "Filtered Gain" if "gain" in out_path.lower() else "Filtered Loss"
+                new_layer = QgsVectorLayer(out_path, layer_name, "ogr")
+                if new_layer.isValid():
+                    QgsProject.instance().addMapLayer(new_layer)
+                    self.log_message(
+                        f"✅ Loaded '{layer_name}' layer in QGIS project ({layer.selectedFeatureCount()} features).")
+                else:
+                    # QgsVectorLayer.error() may vary by QGIS version; try to log useful info
+                    try:
+                        err = new_layer.error().summary()
+                    except Exception:
+                        err = "(no error summary available)"
+                    self.log_message(
+                        f"⚠️ Failed to load exported layer: {err}")
+                    QMessageBox.warning(
+                        dlg, "Warning", f"Exported but failed to load layer. Check log.")
+
+            except Exception as e:
+                QMessageBox.warning(dlg, "Error", str(e))
+                self.log_message(f"Export failed: {e}")
+
+        # === conecta ações
+        # ← NOVO: Antes das conexões
+        self.log_message("🔗 Connecting buttons...")
+        gain_btn_apply.clicked.connect(
+            lambda: apply_filter(gain_layer, gain_canvas, True))
+        loss_btn_apply.clicked.connect(
+            lambda: apply_filter(loss_layer, loss_canvas, False))
+        gain_btn_export.clicked.connect(lambda: export_selection(
+            gain_layer, os.path.join(self.temp_dir, "gain_filtered.shp")))
+        loss_btn_export.clicked.connect(lambda: export_selection(
+            loss_layer, os.path.join(self.temp_dir, "loss_filtered.shp")))
+
+        # === popula canvas inicial com segurança
+        self.log_message("🖼️ Initializing canvases...")  # ← NOVO: Antes do try
+        try:
+            if gain_layer and gain_layer.isValid():
+                gain_canvas.setLayers([gain_layer])
+                gain_canvas.setExtent(gain_layer.extent())
+                gain_canvas.refresh()
+                self.log_message("✅ Gain canvas populated.")
+            if loss_layer and loss_layer.isValid():
+                loss_canvas.setLayers([loss_layer])
+                loss_canvas.setExtent(loss_layer.extent())
+                loss_canvas.refresh()
+                self.log_message("✅ Loss canvas populated.")
+        except Exception as e:
+            self.log_message(f"❌ Error initializing preview canvases: {e}")
+
+        # ← NOVO: Antes de mostrar
+        self.log_message("🚀 About to exec_() dialog...")
+        result = dlg.exec_()  # ← MUDANÇA: Captura o result
+        # ← NOVO: Depois de fechar
+        self.log_message(
+            f"🏁 Dialog closed with result: {result} (0=Reject, 1=Accept)")
+
+        # Opcional: Salva edições nas layers ao fechar (se modificadas)
+        if gain_layer:
+            if gain_layer.isModified():
+                gain_layer.commitChanges()
+                self.log_message("💾 Gain layer changes committed.")
+        if loss_layer:
+            if loss_layer.isModified():
+                loss_layer.commitChanges()
+                self.log_message("💾 Loss layer changes committed.")
 
     def filter_vectors_by_metrics_local(self, gain_layer, loss_layer, min_a, min_p, max_e, min_r):
         """Filtro local pro preview dialog (sem abrir tabela)."""
@@ -2722,168 +2876,193 @@ class UrbanChangeAid:
                                 f"Error exporting filtered vectors: {str(e)}")
 
     def next_to_centroids(self):
-        """Avança para o cálculo de centroides das features selecionadas."""
+        """Avança para o tab de centroids (sem calcular nada automaticamente)."""
         try:
-            gain_layers = QgsProject.instance().mapLayersByName("Gain Vectors (with Metrics)")
-            loss_layers = QgsProject.instance().mapLayersByName("Loss Vectors (with Metrics)")
-
-            if not (gain_layers or loss_layers):
-                QMessageBox.warning(self.dialog, "Warning",
-                                    "No layers with metrics available.")
-                return
-
-            # Processa Gain Vectors
-            if gain_layers and len(gain_layers) > 0:
-                gain_layer = gain_layers[0]
-                selected_features = gain_layer.selectedFeatures()
-                if selected_features:
-                    centroid_path = os.path.join(
-                        self.temp_dir, "gain_centroids.shp")
-                    self._generate_centroids(
-                        gain_layer, selected_features, centroid_path, "Gain Centroids")
-                else:
-                    self.log_message(
-                        "No features selected in Gain layer for centroid calculation.")
-
-            # Processa Loss Vectors
-            if loss_layers and len(loss_layers) > 0:
-                loss_layer = loss_layers[0]
-                selected_features = loss_layer.selectedFeatures()
-                if selected_features:
-                    centroid_path = os.path.join(
-                        self.temp_dir, "loss_centroids.shp")
-                    self._generate_centroids(
-                        loss_layer, selected_features, centroid_path, "Loss Centroids")
-                else:
-                    self.log_message(
-                        "No features selected in Loss layer for centroid calculation.")
-
+            # Pega o atual (deve ser 8 pra Metrics)
+            current_index = self.dialog.tabWidget.currentIndex()
+            next_index = current_index + 1  # Próximo (9 pra Centroids)
+            # ← FIX: Habilita o tab (e seus botões filhos)
+            self.dialog.tabWidget.setTabEnabled(next_index, True)
+            self.dialog.tabWidget.setCurrentIndex(next_index)  # Avança
             self.log_message(
-                "Centroid calculation completed. Proceed to clustering if needed.")
-            QMessageBox.information(
-                self.dialog, "Success", "Centroids calculated. Check log for details.")
-
+                f"➡️ Advanced from tab {current_index} to {next_index} (Centroids). Buttons now enabled.")
         except Exception as e:
-            self.log_message(f"Error calculating centroids: {str(e)}")
+            self.log_message(f"Error advancing to centroids tab: {str(e)}")
             QMessageBox.warning(self.dialog, "Error",
-                                f"Error calculating centroids: {str(e)}")
+                                f"Error advancing: {str(e)}")
 
     def generate_centroids(self):
-        """Gera os centroides das features selecionadas."""
+        """Gera os centroides de TODAS as features nas layers filtradas (Filtered Gain/Loss) usando o algoritmo nativo do QGIS."""
         try:
-            gain_layers = QgsProject.instance().mapLayersByName("Gain Vectors (with Metrics)")
-            loss_layers = QgsProject.instance().mapLayersByName("Loss Vectors (with Metrics)")
+            # Busca layers FILTRADAS (depois do export)
+            gain_layers = QgsProject.instance().mapLayersByName("Filtered Gain")
+            loss_layers = QgsProject.instance().mapLayersByName("Filtered Loss")
 
             if not (gain_layers or loss_layers):
-                QMessageBox.warning(self.dialog, "Warning",
-                                    "No layers with metrics available.")
+                QMessageBox.warning(
+                    self.dialog, "Warning", "No filtered layers available (Filtered Gain/Loss). Run 'Preview Filtered Vectors' > 'Export Selection' first.")
+                self.log_message(
+                    "No filtered layers found — run export before centroids.")
                 return
 
-            # Processa Gain Vectors
+            centroids_generated = False
+
+            # Processa Filtered Gain (TODAS as features)
             if gain_layers and len(gain_layers) > 0:
                 gain_layer = gain_layers[0]
-                selected_features = gain_layer.selectedFeatures()
-                if selected_features:
+                if gain_layer.featureCount() > 0:
                     centroid_path = os.path.join(
-                        self.temp_dir, "gain_centroids.shp")
-                    self._generate_centroids(
-                        gain_layer, selected_features, centroid_path, "Gain Centroids")
-                else:
-                    self.log_message(
-                        "No features selected in Gain layer for centroid calculation.")
+                        self.temp_dir, "filtered_gain_centroids.shp")
+                    params = {
+                        'INPUT': gain_layer,
+                        'ALL_PARTS': False,  # Padrão para centroides simples
+                        'OUTPUT': centroid_path
+                    }
+                    result = processing.run("native:centroids", params)
+                    if 'OUTPUT' in result:
+                        centroid_layer = QgsVectorLayer(
+                            result['OUTPUT'], "Filtered Gain Centroids", "ogr")
+                        if centroid_layer.isValid():
+                            QgsProject.instance().addMapLayer(centroid_layer)
+                            self.log_message(
+                                f"✅ Centroids generated for Filtered Gain ({centroid_layer.featureCount()} points) and loaded in project.")
+                            centroids_generated = True
+                        else:
+                            self.log_message(
+                                "Warning: Invalid centroid layer for Filtered Gain.")
+                    else:
+                        self.log_message(
+                            "Error: No output from centroids algorithm for Filtered Gain.")
+            else:
+                self.log_message("Filtered Gain layer has no features.")
 
-            # Processa Loss Vectors
+            # Processa Filtered Loss (TODAS as features)
             if loss_layers and len(loss_layers) > 0:
                 loss_layer = loss_layers[0]
-                selected_features = loss_layer.selectedFeatures()
-                if selected_features:
+                if loss_layer.featureCount() > 0:
                     centroid_path = os.path.join(
-                        self.temp_dir, "loss_centroids.shp")
-                    self._generate_centroids(
-                        loss_layer, selected_features, centroid_path, "Loss Centroids")
+                        self.temp_dir, "filtered_loss_centroids.shp")
+                    params = {
+                        'INPUT': loss_layer,
+                        'ALL_PARTS': False,  # Padrão para centroides simples
+                        'OUTPUT': centroid_path
+                    }
+                    result = processing.run("native:centroids", params)
+                    if 'OUTPUT' in result:
+                        centroid_layer = QgsVectorLayer(
+                            result['OUTPUT'], "Filtered Loss Centroids", "ogr")
+                        if centroid_layer.isValid():
+                            QgsProject.instance().addMapLayer(centroid_layer)
+                            self.log_message(
+                                f"✅ Centroids generated for Filtered Loss ({centroid_layer.featureCount()} points) and loaded in project.")
+                            centroids_generated = True
+                        else:
+                            self.log_message(
+                                "Warning: Invalid centroid layer for Filtered Loss.")
+                    else:
+                        self.log_message(
+                            "Error: No output from centroids algorithm for Filtered Loss.")
                 else:
-                    self.log_message(
-                        "No features selected in Loss layer for centroid calculation.")
+                    self.log_message("Filtered Loss layer has no features.")
 
-            self.log_message(
-                "Centroid generation completed. Proceed to clustering if needed.")
-            QMessageBox.information(
-                self.dialog, "Success", "Centroids generated. Check log for details.")
+            if centroids_generated:
+                self.log_message(
+                    "Centroid generation completed from all filtered features. Proceed to clustering/export.")
+                QMessageBox.information(
+                    self.dialog, "Success", f"Centroids generated from filtered layers. Check project layers (e.g., Filtered Gain Centroids).")
+            else:
+                self.log_message(
+                    "No centroids generated — filtered layers empty.")
 
         except Exception as e:
             self.log_message(f"Error generating centroids: {str(e)}")
             QMessageBox.warning(self.dialog, "Error",
                                 f"Error generating centroids: {str(e)}")
 
-    def _generate_centroids(self, layer, features, output_path, layer_name):
-        """Calcula os centroides das features selecionadas e salva em um layer."""
-        # Cria um novo layer de pontos
-        crs = layer.crs()
-        writer = QgsVectorFileWriter.create(
-            output_path,
-            "UTF-8",
-            [QgsField("id", QVariant.Int)],
-            QgsWkbTypes.Point,
-            crs,
-            "ESRI Shapefile"
-        )
-
-        if writer.hasError() != QgsVectorFileWriter.NoError:
-            raise Exception(
-                f"Failed to create output file: {writer.errorMessage()}")
-
-        for i, feature in enumerate(features):
-            geom = feature.geometry()
-            centroid = geom.centroid()
-            if centroid:
-                new_feature = QgsFeature()
-                new_feature.setGeometry(centroid)
-                new_feature.setAttributes([i])  # ID simples
-                writer.addFeature(new_feature)
-
-        del writer  # Fecha o writer
-        centroid_layer = QgsVectorLayer(output_path, layer_name, "ogr")
-        if centroid_layer.isValid():
-            QgsProject.instance().addMapLayer(centroid_layer)
-            self.log_message(
-                f"Centroids saved to {output_path} with {len(features)} points.")
-        else:
-            self.log_message(
-                f"Warning: Invalid centroid layer created at {output_path}.")
-
     def export_all_results(self):
-        """Exporta todos os resultados (layers com métricas e centroides) para um diretório."""
+        """Exporta todos os resultados do diretório temporário para um diretório escolhido, com opção de selecionar o que salvar."""
         export_dir = QFileDialog.getExistingDirectory(
             self.dialog, "Select Output Directory for All Results")
         if not export_dir:
             return
 
         try:
-            layers_to_export = [
-                ("Gain Vectors (with Metrics)", "gain_vectors_with_metrics.shp"),
-                ("Loss Vectors (with Metrics)", "loss_vectors_with_metrics.shp"),
-                ("Gain Centroids", "gain_centroids.shp"),
-                ("Loss Centroids", "loss_centroids.shp")
-            ]
+            # Lista todos os arquivos no temp_dir (filtros para .shp, .tif, etc.)
+            files_in_temp = [f for f in os.listdir(
+                self.temp_dir) if os.path.isfile(os.path.join(self.temp_dir, f))]
+            if not files_in_temp:
+                self.log_message("No files found in temp directory to export.")
+                QMessageBox.information(
+                    self.dialog, "Info", "No files available in temp directory.")
+                return
 
-            for layer_name, output_filename in layers_to_export:
-                layers = QgsProject.instance().mapLayersByName(layer_name)
-                if layers and len(layers) > 0:
-                    layer = layers[0]
-                    output_path = os.path.join(export_dir, output_filename)
-                    error = QgsVectorFileWriter.writeAsVectorFormat(
-                        layer, output_path, "UTF-8", layer.crs(), "ESRI Shapefile"
-                    )
-                    if error[0] == QgsVectorFileWriter.NoError:
-                        self.log_message(
-                            f"Exported {layer_name} to {output_path}")
-                    else:
-                        self.log_message(
-                            f"Error exporting {layer_name} to {output_path}: {error[1]}")
+            # Cria dialog para seleção (com checkboxes)
+            select_dlg = QDialog(self.dialog)
+            select_dlg.setWindowTitle("Select Files to Export")
+            # ← FIX: Modal pra não sumir ao clicar fora, bloqueia só o parent
+            select_dlg.setWindowModality(Qt.WindowModal)
+            select_dlg.resize(800, 400)  # ← NOVO: Tamanho maior pra não cortar
+            select_layout = QVBoxLayout(select_dlg)
 
-            self.log_message("All results exported successfully.")
-            QMessageBox.information(
-                self.dialog, "Success", f"All results exported to {export_dir}")
+            # Grupo com checkboxes em grid horizontal (pra não cortar vertical)
+            group_box = QGroupBox("Select files from temp:")
+            # ← FIX: QGridLayout pra disposição horizontal (3 colunas, ajustável)
+            group_layout = QGridLayout(group_box)
+            checkboxes = []
+            num_columns = 3  # Colunas pra wrap horizontal
+            for i, file in enumerate(files_in_temp):
+                chk = QCheckBox(file)
+                chk.setChecked(True)  # Todos selecionados por default
+                row = i // num_columns
+                col = i % num_columns
+                group_layout.addWidget(chk, row, col)
+                checkboxes.append(chk)
+
+            # Scroll se muitos arquivos
+            scroll_area = QScrollArea()
+            scroll_area.setWidget(group_box)
+            scroll_area.setWidgetResizable(True)
+            select_layout.addWidget(scroll_area)
+
+            # Botões OK/Cancel
+            btn_layout = QHBoxLayout()
+            ok_btn = QPushButton("Export Selected")
+            cancel_btn = QPushButton("Cancel")
+            btn_layout.addWidget(ok_btn)
+            btn_layout.addWidget(cancel_btn)
+            select_layout.addLayout(btn_layout)
+
+            def export_selected():
+                selected_files = [chk.text()
+                                  for chk in checkboxes if chk.isChecked()]
+                if not selected_files:
+                    QMessageBox.warning(
+                        select_dlg, "Warning", "No files selected.")
+                    return
+
+                exported_count = 0
+                for file in selected_files:
+                    src_path = os.path.join(self.temp_dir, file)
+                    dest_path = os.path.join(export_dir, file)
+                    try:
+                        # Copia o arquivo (simples, pra qualquer tipo)
+                        shutil.copy(src_path, dest_path)
+                        self.log_message(f"Exported {file} to {dest_path}")
+                        exported_count += 1
+                    except Exception as copy_e:
+                        self.log_message(
+                            f"Error copying {file}: {str(copy_e)}")
+
+                self.log_message(
+                    f"All selected results ({exported_count}) exported successfully.")
+                QMessageBox.information(
+                    self.dialog, "Success", f"Selected files exported to {export_dir}")
+                select_dlg.accept()
+
+            ok_btn.clicked.connect(export_selected)
+            cancel_btn.clicked.connect(select_dlg.reject)
+
+            select_dlg.exec_()  # Modal exec pra ficar aberto até OK/Cancel
 
         except Exception as e:
             self.log_message(f"Error exporting all results: {str(e)}")
