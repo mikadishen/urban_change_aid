@@ -186,6 +186,34 @@ class UrbanChangeAid:
             try:
                 self.dialog = uic.loadUi(ui_path)
 
+                # Adicione isso no método run(self), após carregar o UI e antes dos connects (depois de self.dialog = uic.loadUi(ui_path))
+                # Encontra o tab Centroids (índice 9, ajuste se necessário)
+                centroids_tab = self.dialog.tabWidget.widget(
+                    9)  # Índice do tab "Centroids & Export"
+                if centroids_tab:
+                    layout = centroids_tab.layout()  # Assume QVBoxLayout já existe no tab
+                    if layout:
+                        # Adiciona botão "Generate Heatmaps"
+                        generate_heatmaps_btn = QPushButton(
+                            "Generate Heatmaps from Centroids")
+                        # Insere no topo do layout
+                        layout.insertWidget(0, generate_heatmaps_btn)
+                        # conecta somente se o método existir para evitar exceptions em tempo de execução
+                        if hasattr(self, 'generate_heatmaps'):
+                            generate_heatmaps_btn.clicked.connect(
+                                self.generate_heatmaps)
+                            self.log_message(
+                                "Added 'Generate Heatmaps' button to Centroids tab.")
+                        else:
+                            self.log_message(
+                                "Generate heatmaps method not found; button added without connection.")
+                    else:
+                        self.log_message(
+                            "Warning: No layout found in Centroids tab — button not added.")
+                else:
+                    self.log_message(
+                        "Warning: Centroids tab not found — button not added.")
+
                 # preenche combos com camadas vetoriais já no projeto (se houver)
                 # self.populate_vector_combos()
 
@@ -204,10 +232,10 @@ class UrbanChangeAid:
                     self.log_text = self.dialog.logTextEdit
                 else:
                     self.log_text = QTextEdit(self.dialog)
-                    layout = self.dialog.layout()
-                    if layout:
-                        layout.addWidget(QLabel("Log:"))
-                        layout.addWidget(self.log_text)
+                    main_layout = self.dialog.layout()
+                    if main_layout:
+                        main_layout.addWidget(QLabel("Log:"))
+                        main_layout.addWidget(self.log_text)
 
                 # top layout com botões
                 top_layout = QHBoxLayout()
@@ -2978,6 +3006,146 @@ class UrbanChangeAid:
             self.log_message(f"Error generating centroids: {str(e)}")
             QMessageBox.warning(self.dialog, "Error",
                                 f"Error generating centroids: {str(e)}")
+
+    def generate_heatmaps(self):
+        """Gera heatmaps opcionais a partir dos centroids de Filtered Gain/Loss, com escolha do usuário."""
+        try:
+            # Busca layers de centroids
+            gain_centroids_layers = QgsProject.instance(
+            ).mapLayersByName("Filtered Gain Centroids")
+            loss_centroids_layers = QgsProject.instance(
+            ).mapLayersByName("Filtered Loss Centroids")
+
+            if not (gain_centroids_layers or loss_centroids_layers):
+                QMessageBox.warning(self.dialog, "Warning",
+                                    "No centroid layers available (Filtered Gain/Loss Centroids). Generate centroids first.")
+                self.log_message(
+                    "No centroid layers found — generate centroids before heatmaps.")
+                return
+
+            # Dialog para escolha (Gain, Loss ou Both)
+            choice_dlg = QDialog(self.dialog)
+            choice_dlg.setWindowTitle("Generate Heatmaps")
+            choice_layout = QVBoxLayout(choice_dlg)
+
+            group_box = QGroupBox("Select which heatmaps to generate:")
+            group_layout = QVBoxLayout(group_box)
+            radio_gain = QRadioButton("Gain Centroids Only")
+            radio_loss = QRadioButton("Loss Centroids Only")
+            radio_both = QRadioButton("Both Gain and Loss")
+            radio_both.setChecked(True)  # Default: Both
+            group_layout.addWidget(radio_gain)
+            group_layout.addWidget(radio_loss)
+            group_layout.addWidget(radio_both)
+            choice_layout.addWidget(group_box)
+
+            # Slider para Radius (opcional, default 1000m)
+            radius_box = QHBoxLayout()
+            radius_lbl = QLabel("Kernel Radius (map units, e.g., meters):")
+            radius_spin = QDoubleSpinBox()
+            radius_spin.setRange(1, 100000)
+            radius_spin.setValue(1000)
+            radius_spin.setSingleStep(100)
+            radius_box.addWidget(radius_lbl)
+            radius_box.addWidget(radius_spin)
+            choice_layout.addLayout(radius_box)
+
+            # Botões OK/Cancel
+            btn_layout = QHBoxLayout()
+            ok_btn = QPushButton("Generate")
+            cancel_btn = QPushButton("Cancel")
+            btn_layout.addWidget(ok_btn)
+            btn_layout.addWidget(cancel_btn)
+            choice_layout.addLayout(btn_layout)
+
+            def generate_selected():
+                radius = radius_spin.value()
+                heatmaps_generated = False
+
+                # Processa Gain se selecionado
+                if radio_gain.isChecked() or radio_both.isChecked():
+                    if gain_centroids_layers:
+                        gain_centroids = gain_centroids_layers[0]
+                        if gain_centroids.featureCount() > 0:
+                            heatmap_path = os.path.join(
+                                self.temp_dir, "gain_heatmap.tif")
+                            params = {
+                                'INPUT': gain_centroids,
+                                'RADIUS': radius,
+                                'PIXEL_SIZE': 10,  # Ajuste para resolução desejada
+                                'KERNEL': 0,  # Quartic (default)
+                                'OUTPUT': heatmap_path
+                            }
+                            # processamento: use .get to be resilient ao formato de retorno
+                            result = processing.run(
+                                "qgis:heatmapkerneldensityestimation", params)
+                            out_path = result.get('OUTPUT') or result.get(
+                                'OUTPUT_RASTER') or result.get('OUTPUT_LAYER')
+                            if out_path:
+                                heatmap_layer = QgsRasterLayer(
+                                    out_path, "Gain Heatmap")
+                                if heatmap_layer.isValid():
+                                    QgsProject.instance().addMapLayer(heatmap_layer)
+                                    self.log_message(
+                                        f"✅ Gain Heatmap generated ({radius}m radius) and loaded in project.")
+                                    heatmaps_generated = True
+                                else:
+                                    self.log_message(
+                                        "Warning: Invalid Gain Heatmap layer.")
+                        else:
+                            self.log_message(
+                                "Filtered Gain Centroids has no features.")
+
+                # Processa Loss se selecionado
+                if radio_loss.isChecked() or radio_both.isChecked():
+                    if loss_centroids_layers:
+                        loss_centroids = loss_centroids_layers[0]
+                        if loss_centroids.featureCount() > 0:
+                            heatmap_path = os.path.join(
+                                self.temp_dir, "loss_heatmap.tif")
+                            params = {
+                                'INPUT': loss_centroids,
+                                'RADIUS': radius,
+                                'PIXEL_SIZE': 10,  # Ajuste para resolução desejada
+                                'KERNEL': 0,  # Quartic (default)
+                                'OUTPUT': heatmap_path
+                            }
+                            result = processing.run(
+                                "qgis:heatmapkerneldensityestimation", params)
+                            out_path = result.get('OUTPUT') or result.get(
+                                'OUTPUT_RASTER') or result.get('OUTPUT_LAYER')
+                            if out_path:
+                                heatmap_layer = QgsRasterLayer(
+                                    out_path, "Loss Heatmap")
+                                if heatmap_layer.isValid():
+                                    QgsProject.instance().addMapLayer(heatmap_layer)
+                                    self.log_message(
+                                        f"✅ Loss Heatmap generated ({radius}m radius) and loaded in project.")
+                                    heatmaps_generated = True
+                                else:
+                                    self.log_message(
+                                        "Warning: Invalid Loss Heatmap layer.")
+                        else:
+                            self.log_message(
+                                "Filtered Loss Centroids has no features.")
+
+                if heatmaps_generated:
+                    QMessageBox.information(
+                        self.dialog, "Success", "Heatmaps generated and loaded. They will be included in Export All if in temp dir.")
+                else:
+                    self.log_message(
+                        "No heatmaps generated — no centroid features available.")
+                choice_dlg.accept()
+
+            ok_btn.clicked.connect(generate_selected)
+            cancel_btn.clicked.connect(choice_dlg.reject)
+
+            choice_dlg.exec_()
+
+        except Exception as e:
+            self.log_message(f"Error generating heatmaps: {str(e)}")
+            QMessageBox.warning(self.dialog, "Error",
+                                f"Error generating heatmaps: {str(e)}")
 
     def export_all_results(self):
         """Exporta todos os resultados do diretório temporário para um diretório escolhido, com opção de selecionar o que salvar."""
