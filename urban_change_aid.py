@@ -71,6 +71,8 @@ class UrbanChangeAid:
         self.first_start = None
         self.dialog = None
         self.loaded_layer_ids = []
+        self.monitoring_year = None  # Track which year is being georeferenced
+        self.layer_count_before = 0  # Track layer count before georeferencing
         self.log_message("Initial attributes set.")
 
         self.temp_dir = os.path.join(self.plugin_dir, 'temp')
@@ -545,12 +547,103 @@ class UrbanChangeAid:
             self.dialog.comboYear1.addItem(layer.name(), layer.source())
             self.dialog.comboYear2.addItem(layer.name(), layer.source())
 
+    def start_layer_monitoring(self, year):
+        """Start monitoring for new layers added to the project after georeferencing."""
+        self.monitoring_year = year
+        self.layer_count_before = len(QgsProject.instance().mapLayers())
+        
+        # Connect to layer added signal
+        QgsProject.instance().layersAdded.connect(self.on_layers_added)
+        self.log_message(f"Started monitoring for new georeferenced layers ({year})")
+    
+    def on_layers_added(self, layers):
+        """Called when new layers are added to the project."""
+        if not self.monitoring_year:
+            return
+        
+        # Check if any new raster layer was added
+        for layer in layers:
+            if isinstance(layer, QgsRasterLayer) and layer.isValid():
+                # Check if it's georeferenced
+                if self.check_georeferencing(layer.source()):
+                    self.log_message(f"New georeferenced layer detected: {layer.name()}")
+                    
+                    # Update the appropriate year path
+                    if self.monitoring_year == 'year1':
+                        self.year1_path = layer.source()
+                        self.dialog.comboYear1.setCurrentText(layer.name())
+                        QMessageBox.information(
+                            self.dialog,
+                            "Georeferenced File Detected",
+                            f"The georeferenced file '{layer.name()}' has been detected and set as Year 1 image.\n\n"
+                            "You can now proceed to the next step."
+                        )
+                    elif self.monitoring_year == 'year2':
+                        self.year2_path = layer.source()
+                        self.dialog.comboYear2.setCurrentText(layer.name())
+                        QMessageBox.information(
+                            self.dialog,
+                            "Georeferenced File Detected",
+                            f"The georeferenced file '{layer.name()}' has been detected and set as Year 2 image.\n\n"
+                            "You can now proceed to the next step."
+                        )
+                    
+                    # Refresh layer list
+                    self.populate_project_layers()
+                    
+                    # Stop monitoring
+                    self.stop_layer_monitoring()
+                    break
+    
+    def stop_layer_monitoring(self):
+        """Stop monitoring for new layers."""
+        try:
+            QgsProject.instance().layersAdded.disconnect(self.on_layers_added)
+        except:
+            pass
+        self.monitoring_year = None
+        self.log_message("Stopped layer monitoring")
+
+    def check_georeferencing(self, file_path):
+        """Check if a raster file is georeferenced."""
+        try:
+            ds = gdal.Open(file_path)
+            if ds is None:
+                return False
+            
+            # Check if has valid projection
+            projection = ds.GetProjection()
+            geotransform = ds.GetGeoTransform()
+            ds = None
+            
+            # Default geotransform is (0, 1, 0, 0, 0, 1) - not georeferenced
+            has_projection = projection is not None and projection != ""
+            has_geotransform = geotransform is not None and geotransform != (0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+            
+            return has_projection and has_geotransform
+        except Exception as e:
+            self.log_message(f"Error checking georeferencing: {str(e)}")
+            return False
+
     def browse_year1(self):
         file_path, _ = QFileDialog.getOpenFileName(self.dialog, "Select Year 1 Image", "",
                                                    "Image Files (*.tif *.tiff *.jpg *.jpeg *.png)")
         if file_path:
             self.year1_path = file_path
             self.dialog.comboYear1.setCurrentText(os.path.basename(file_path))
+            
+            # Check if georeferenced
+            if not self.check_georeferencing(file_path):
+                QMessageBox.warning(
+                    self.dialog,
+                    "Image Not Georeferenced",
+                    f"The selected image '{os.path.basename(file_path)}' is not georeferenced.\n\n"
+                    "Please click the 'Georeference Year 1' button to open the QGIS Georeferencer tool.\n\n"
+                    "After georeferencing, the plugin will automatically detect the new georeferenced file."
+                )
+                self.log_message(f"Year 1 image not georeferenced: {file_path}")
+            else:
+                self.log_message(f"Year 1 image is georeferenced: {file_path}")
 
     def browse_year2(self):
         file_path, _ = QFileDialog.getOpenFileName(self.dialog, "Select Year 2 Image", "",
@@ -558,19 +651,100 @@ class UrbanChangeAid:
         if file_path:
             self.year2_path = file_path
             self.dialog.comboYear2.setCurrentText(os.path.basename(file_path))
+            
+            # Check if georeferenced
+            if not self.check_georeferencing(file_path):
+                QMessageBox.warning(
+                    self.dialog,
+                    "Image Not Georeferenced",
+                    f"The selected image '{os.path.basename(file_path)}' is not georeferenced.\n\n"
+                    "Please click the 'Georeference Year 2' button to open the QGIS Georeferencer tool.\n\n"
+                    "After georeferencing, the plugin will automatically detect the new georeferenced file."
+                )
+                self.log_message(f"Year 2 image not georeferenced: {file_path}")
+            else:
+                self.log_message(f"Year 2 image is georeferenced: {file_path}")
 
     def georeference_year1(self):
+        """Opens the QGIS Georeferencer tool and monitors for new georeferenced files."""
         if self.year1_path:
-            processing.execAlgorithmDialog(
-                "gdal:georeferencer", {"INPUT": self.year1_path})
+            try:
+                # Open QGIS native georeferencer
+                self.iface.showGeoreferencer()
+                self.log_message(f"Georeferencer opened for: {self.year1_path}")
+                
+                # Show info message
+                QMessageBox.information(
+                    self.dialog,
+                    "Georeferencer Opened",
+                    f"The QGIS Georeferencer has been opened.\n\n"
+                    f"Please georeference the image: {os.path.basename(self.year1_path)}\n\n"
+                    "After saving the georeferenced file, the plugin will automatically detect it in the project layers."
+                )
+                
+                # Start monitoring for new layers
+                self.start_layer_monitoring('year1')
+                
+            except AttributeError:
+                # Fallback if showGeoreferencer is not available
+                QMessageBox.warning(
+                    self.dialog,
+                    "Georeferencer Not Available",
+                    "The Georeferencer tool is not available in this QGIS version.\n\n"
+                    "Please open it manually from: Raster → Georeferencer\n\n"
+                    f"Selected file: {os.path.basename(self.year1_path)}"
+                )
+            except Exception as e:
+                self.log_message(f"Error opening georeferencer: {str(e)}")
+                QMessageBox.warning(
+                    self.dialog,
+                    "Error",
+                    f"Could not open the georeferencer automatically.\n"
+                    f"Please open manually from: Raster → Georeferencer\n\n"
+                    f"Error: {str(e)}"
+                )
         else:
             QMessageBox.warning(self.dialog, "Warning",
                                 "Please select Year 1 image first.")
 
     def georeference_year2(self):
+        """Opens the QGIS Georeferencer tool and monitors for new georeferenced files."""
         if self.year2_path:
-            processing.execAlgorithmDialog(
-                "gdal:georeferencer", {"INPUT": self.year2_path})
+            try:
+                # Open QGIS native georeferencer
+                self.iface.showGeoreferencer()
+                self.log_message(f"Georeferencer opened for: {self.year2_path}")
+                
+                # Show info message
+                QMessageBox.information(
+                    self.dialog,
+                    "Georeferencer Opened",
+                    f"The QGIS Georeferencer has been opened.\n\n"
+                    f"Please georeference the image: {os.path.basename(self.year2_path)}\n\n"
+                    "After saving the georeferenced file, the plugin will automatically detect it in the project layers."
+                )
+                
+                # Start monitoring for new layers
+                self.start_layer_monitoring('year2')
+                
+            except AttributeError:
+                # Fallback if showGeoreferencer is not available
+                QMessageBox.warning(
+                    self.dialog,
+                    "Georeferencer Not Available",
+                    "The Georeferencer tool is not available in this QGIS version.\n\n"
+                    "Please open it manually from: Raster → Georeferencer\n\n"
+                    f"Selected file: {os.path.basename(self.year2_path)}"
+                )
+            except Exception as e:
+                self.log_message(f"Error opening georeferencer: {str(e)}")
+                QMessageBox.warning(
+                    self.dialog,
+                    "Error",
+                    f"Could not open the georeferencer automatically.\n"
+                    f"Please open manually from: Raster → Georeferencer\n\n"
+                    f"Error: {str(e)}"
+                )
         else:
             QMessageBox.warning(self.dialog, "Warning",
                                 "Please select Year 2 image first.")
