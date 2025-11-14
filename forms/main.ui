@@ -17,7 +17,7 @@
    <item>
     <widget class="QTabWidget" name="tabWidget">
      <property name="currentIndex">
-      <number>8</number>
+      <number>7</number>
      </property>
      <widget class="QWidget" name="tabInput">
       <attribute name="title">
@@ -374,13 +374,6 @@
         <widget class="QPushButton" name="generateMasks">
          <property name="text">
           <string>Generate Gain &amp; Loss Masks</string>
-         </property>
-        </widget>
-       </item>
-       <item>
-        <widget class="QPushButton" name="applySieveMasksButton">
-         <property name="text">
-          <string>Apply Sieve (Gain/Loss)</string>
          </property>
         </widget>
        </item>
