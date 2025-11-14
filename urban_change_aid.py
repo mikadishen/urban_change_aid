@@ -291,15 +291,42 @@ class UrbanChangeAid:
 
     def show_help(self):
         help_text = (
-            "Urban Change Aid - Help\n\n"
-            "1. Select the images for the desired years.\n"
-            "2. Align and crop the images.\n"
-            "3. Extract bands and normalize contrast.\n"
-            "4. Binarize the images and calculate the diff.\n"
-            "5. Generate gain/loss masks and vectorize.\n"
-            "6. Filter metrics and generate centroids.\n"
-            "7. Export the results.\n\n"
-            "Use the preview buttons for fine adjustments in each step."
+
+            "Urban Change Aid - User Guide\n\n"
+            "This plugin assists in detecting urban changes from two satellite or aerial images taken at different dates. Follow the tabs in sequence for best results.\n\n"
+            " FAQ & Quick Tips \n"
+            "- Georeferencing Error: If an image is not georeferenced, use the `Georeference` button to open QGIS's native tool. After saving, the plugin will automatically detect the new file.\n"
+            "- Unexpected Results: Detection quality depends heavily on alignment, contrast and binarization threshold. Use the `Preview` buttons and adjust parameters at each stage.\n"
+            "- Plugin Slow: Processing large images can be time-consuming. Consider cropping (`Crop`) an area of interest to run quick tests.\n"
+            "- What is Sieve?: The `Sieve` filter removes small polygons (noise) from the result, keeping only the most significant change areas. It is highly recommended to apply it to gain/loss masks.\n\n"
+            " Step-by-step Guide by Tab \n\n"
+            "1. Input Images:\n"
+            "   - Select Images: Use the `Browse` buttons or choose layers already loaded in the project for Year 1 (older) and Year 2 (more recent).\n"
+            "   - Georeference: If necessary, georeference the images. The plugin will monitor and load the result.\n\n"
+            "2. Alignment/Crop:\n"
+            "   - Align: Images must have the same dimensions and alignment. Use the `Crop` tool to ensure this.\n"
+            "   - Suggest Size: Use this button for the plugin to suggest a crop size corresponding to the intersection of both images.\n"
+            "   - Apply Crop: Applies the crop. Cropped images will be used in subsequent steps.\n\n"
+            "3. Band/Contrast:\n"
+            "   - Extract Band: Select a band (e.g., Red, NIR) that best highlights urban areas. Visible-spectrum bands usually work well.\n"
+            "   - Normalize Contrast: Adjust contrast so urban features are well highlighted in both images. Use the histogram to set min/max values.\n\n"
+            "4. Binarization:\n"
+            "   - Binarize: Converts images to black and white, where (ideally) white represents urban areas and black represents the rest. Adjust the `Threshold` to correctly separate classes.\n"
+            "   - Sieve: Applies a filter to clean noise in the binarized image before calculating the difference.\n\n"
+            "5. Difference Map:\n"
+            "   - Calculate Difference: Generates a map that shows where changes occurred between the two binarized images.\n\n"
+            "6. Gain/Loss Mask:\n"
+            "   - Generate Masks: Creates two separate masks: `Gain` (new urban areas) and `Loss` (areas that stopped being urban).\n"
+            "   - Apply Sieve (Gain/Loss): Crucial step. Applies the Sieve filter directly to the gain and loss masks to remove small irrelevant detections. Adjust the `Threshold` to define the minimum change area to keep.\n\n"
+            "7. Vectorization:\n"
+            "   - Vectorize: Converts the gain and loss masks (with or without sieve) from raster (pixels) to vector (polygons). The plugin will automatically use the sieved masks if they exist.\n\n"
+            "8. Metrics Filter:\n"
+            "   - Calculate Metrics: Computes geometric metrics (area, perimeter, etc.) for each change polygon.\n"
+            "   - Filter: Use the sliders to filter polygons based on these metrics, removing undesired shapes (e.g., very thin or very small polygons).\n\n"
+            "9. Centroids & Export:\n"
+            "   - Generate Centroids: Creates a point at the center of each filtered change polygon.\n"
+            "   - Generate Heatmaps: Creates heatmaps from centroids to visualize the density of changes.\n"
+            "   - Export: Export the final results (filtered vectors, centroids) to formats such as Shapefile or GeoPackage.\n"
         )
         QMessageBox.information(
             self.dialog, "Help - Urban Change Aid", help_text)
@@ -376,6 +403,18 @@ class UrbanChangeAid:
                 f"difference_path: {self.difference_path}, exists: {os.path.exists(self.difference_path) if self.difference_path else False}")
             self.dialog.generateMasks.clicked.connect(
                 self.on_generate_gain_loss_clicked)
+
+        # Botão Apply Sieve para Gain/Loss masks
+        if hasattr(self.dialog, 'btnApplySieveGainLoss'):
+            self.dialog.btnApplySieveGainLoss.clicked.connect(
+                lambda: self.apply_sieve_to_masks(
+                    threshold=self.dialog.spinSieveThresholdGainLoss.value() if hasattr(
+                        self.dialog, 'spinSieveThresholdGainLoss') else 8,
+                    connectivity=8
+                )
+            )
+            self.log_message(
+                "Connected btnApplySieveGainLoss to apply_sieve_to_masks")
 
         if hasattr(self.dialog, 'nextToVector'):
             self.dialog.nextToVector.clicked.connect(self.nextToVector)
@@ -551,23 +590,25 @@ class UrbanChangeAid:
         """Start monitoring for new layers added to the project after georeferencing."""
         self.monitoring_year = year
         self.layer_count_before = len(QgsProject.instance().mapLayers())
-        
+
         # Connect to layer added signal
         QgsProject.instance().layersAdded.connect(self.on_layers_added)
-        self.log_message(f"Started monitoring for new georeferenced layers ({year})")
-    
+        self.log_message(
+            f"Started monitoring for new georeferenced layers ({year})")
+
     def on_layers_added(self, layers):
         """Called when new layers are added to the project."""
         if not self.monitoring_year:
             return
-        
+
         # Check if any new raster layer was added
         for layer in layers:
             if isinstance(layer, QgsRasterLayer) and layer.isValid():
                 # Check if it's georeferenced
                 if self.check_georeferencing(layer.source()):
-                    self.log_message(f"New georeferenced layer detected: {layer.name()}")
-                    
+                    self.log_message(
+                        f"New georeferenced layer detected: {layer.name()}")
+
                     # Update the appropriate year path
                     if self.monitoring_year == 'year1':
                         self.year1_path = layer.source()
@@ -587,14 +628,14 @@ class UrbanChangeAid:
                             f"The georeferenced file '{layer.name()}' has been detected and set as Year 2 image.\n\n"
                             "You can now proceed to the next step."
                         )
-                    
+
                     # Refresh layer list
                     self.populate_project_layers()
-                    
+
                     # Stop monitoring
                     self.stop_layer_monitoring()
                     break
-    
+
     def stop_layer_monitoring(self):
         """Stop monitoring for new layers."""
         try:
@@ -610,16 +651,17 @@ class UrbanChangeAid:
             ds = gdal.Open(file_path)
             if ds is None:
                 return False
-            
+
             # Check if has valid projection
             projection = ds.GetProjection()
             geotransform = ds.GetGeoTransform()
             ds = None
-            
+
             # Default geotransform is (0, 1, 0, 0, 0, 1) - not georeferenced
             has_projection = projection is not None and projection != ""
-            has_geotransform = geotransform is not None and geotransform != (0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-            
+            has_geotransform = geotransform is not None and geotransform != (
+                0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
             return has_projection and has_geotransform
         except Exception as e:
             self.log_message(f"Error checking georeferencing: {str(e)}")
@@ -631,7 +673,7 @@ class UrbanChangeAid:
         if file_path:
             self.year1_path = file_path
             self.dialog.comboYear1.setCurrentText(os.path.basename(file_path))
-            
+
             # Check if georeferenced
             if not self.check_georeferencing(file_path):
                 QMessageBox.warning(
@@ -641,7 +683,8 @@ class UrbanChangeAid:
                     "Please click the 'Georeference Year 1' button to open the QGIS Georeferencer tool.\n\n"
                     "After georeferencing, the plugin will automatically detect the new georeferenced file."
                 )
-                self.log_message(f"Year 1 image not georeferenced: {file_path}")
+                self.log_message(
+                    f"Year 1 image not georeferenced: {file_path}")
             else:
                 self.log_message(f"Year 1 image is georeferenced: {file_path}")
 
@@ -651,7 +694,7 @@ class UrbanChangeAid:
         if file_path:
             self.year2_path = file_path
             self.dialog.comboYear2.setCurrentText(os.path.basename(file_path))
-            
+
             # Check if georeferenced
             if not self.check_georeferencing(file_path):
                 QMessageBox.warning(
@@ -661,7 +704,8 @@ class UrbanChangeAid:
                     "Please click the 'Georeference Year 2' button to open the QGIS Georeferencer tool.\n\n"
                     "After georeferencing, the plugin will automatically detect the new georeferenced file."
                 )
-                self.log_message(f"Year 2 image not georeferenced: {file_path}")
+                self.log_message(
+                    f"Year 2 image not georeferenced: {file_path}")
             else:
                 self.log_message(f"Year 2 image is georeferenced: {file_path}")
 
@@ -671,8 +715,9 @@ class UrbanChangeAid:
             try:
                 # Open QGIS native georeferencer
                 self.iface.showGeoreferencer()
-                self.log_message(f"Georeferencer opened for: {self.year1_path}")
-                
+                self.log_message(
+                    f"Georeferencer opened for: {self.year1_path}")
+
                 # Show info message
                 QMessageBox.information(
                     self.dialog,
@@ -681,10 +726,10 @@ class UrbanChangeAid:
                     f"Please georeference the image: {os.path.basename(self.year1_path)}\n\n"
                     "After saving the georeferenced file, the plugin will automatically detect it in the project layers."
                 )
-                
+
                 # Start monitoring for new layers
                 self.start_layer_monitoring('year1')
-                
+
             except AttributeError:
                 # Fallback if showGeoreferencer is not available
                 QMessageBox.warning(
@@ -713,8 +758,9 @@ class UrbanChangeAid:
             try:
                 # Open QGIS native georeferencer
                 self.iface.showGeoreferencer()
-                self.log_message(f"Georeferencer opened for: {self.year2_path}")
-                
+                self.log_message(
+                    f"Georeferencer opened for: {self.year2_path}")
+
                 # Show info message
                 QMessageBox.information(
                     self.dialog,
@@ -723,10 +769,10 @@ class UrbanChangeAid:
                     f"Please georeference the image: {os.path.basename(self.year2_path)}\n\n"
                     "After saving the georeferenced file, the plugin will automatically detect it in the project layers."
                 )
-                
+
                 # Start monitoring for new layers
                 self.start_layer_monitoring('year2')
-                
+
             except AttributeError:
                 # Fallback if showGeoreferencer is not available
                 QMessageBox.warning(
@@ -1149,45 +1195,93 @@ class UrbanChangeAid:
             canvas = FigureCanvas(fig)
             layout.addWidget(canvas)
 
+            # Min Year 1 - Label, Slider e SpinBox
+            min1_label = QLabel("Min Year 1:")
             min1_slider = QSlider(Qt.Horizontal)
             min1_slider.setRange(0, 255)
             min1_slider.setValue(int(np.nanmin(band1))
                                  if not np.all(np.isnan(band1)) else 0)
-            min1_label = QLabel(f"Min Year 1: {min1_slider.value()}")
-            min1_slider.valueChanged.connect(
-                lambda val: min1_label.setText(f"Min Year 1: {val}"))
+            min1_spinbox = QSpinBox()
+            min1_spinbox.setRange(0, 255)
+            min1_spinbox.setValue(min1_slider.value())
+            
+            # Sincronização bidirecional
+            min1_slider.valueChanged.connect(min1_spinbox.setValue)
+            min1_spinbox.valueChanged.connect(min1_slider.setValue)
+            
+            # Layout horizontal para slider e spinbox
+            min1_layout = QHBoxLayout()
+            min1_layout.addWidget(min1_slider)
+            min1_layout.addWidget(min1_spinbox)
+            
             layout.addWidget(min1_label)
-            layout.addWidget(min1_slider)
+            layout.addLayout(min1_layout)
 
+            # Max Year 1 - Label, Slider e SpinBox
+            max1_label = QLabel("Max Year 1:")
             max1_slider = QSlider(Qt.Horizontal)
             max1_slider.setRange(0, 255)
             max1_slider.setValue(int(np.nanmax(band1))
                                  if not np.all(np.isnan(band1)) else 255)
-            max1_label = QLabel(f"Max Year 1: {max1_slider.value()}")
-            max1_slider.valueChanged.connect(
-                lambda val: max1_label.setText(f"Max Year 1: {val}"))
+            max1_spinbox = QSpinBox()
+            max1_spinbox.setRange(0, 255)
+            max1_spinbox.setValue(max1_slider.value())
+            
+            # Sincronização bidirecional
+            max1_slider.valueChanged.connect(max1_spinbox.setValue)
+            max1_spinbox.valueChanged.connect(max1_slider.setValue)
+            
+            # Layout horizontal para slider e spinbox
+            max1_layout = QHBoxLayout()
+            max1_layout.addWidget(max1_slider)
+            max1_layout.addWidget(max1_spinbox)
+            
             layout.addWidget(max1_label)
-            layout.addWidget(max1_slider)
+            layout.addLayout(max1_layout)
 
+            # Min Year 2 - Label, Slider e SpinBox
+            min2_label = QLabel("Min Year 2:")
             min2_slider = QSlider(Qt.Horizontal)
             min2_slider.setRange(0, 255)
             min2_slider.setValue(int(np.nanmin(band2))
                                  if not np.all(np.isnan(band2)) else 0)
-            min2_label = QLabel(f"Min Year 2: {min2_slider.value()}")
-            min2_slider.valueChanged.connect(
-                lambda val: min2_label.setText(f"Min Year 2: {val}"))
+            min2_spinbox = QSpinBox()
+            min2_spinbox.setRange(0, 255)
+            min2_spinbox.setValue(min2_slider.value())
+            
+            # Sincronização bidirecional
+            min2_slider.valueChanged.connect(min2_spinbox.setValue)
+            min2_spinbox.valueChanged.connect(min2_slider.setValue)
+            
+            # Layout horizontal para slider e spinbox
+            min2_layout = QHBoxLayout()
+            min2_layout.addWidget(min2_slider)
+            min2_layout.addWidget(min2_spinbox)
+            
             layout.addWidget(min2_label)
-            layout.addWidget(min2_slider)
+            layout.addLayout(min2_layout)
 
+            # Max Year 2 - Label, Slider e SpinBox
+            max2_label = QLabel("Max Year 2:")
             max2_slider = QSlider(Qt.Horizontal)
             max2_slider.setRange(0, 255)
             max2_slider.setValue(int(np.nanmax(band2))
                                  if not np.all(np.isnan(band2)) else 255)
-            max2_label = QLabel(f"Max Year 2: {max2_slider.value()}")
-            max2_slider.valueChanged.connect(
-                lambda val: max2_label.setText(f"Max Year 2: {val}"))
+            max2_spinbox = QSpinBox()
+            max2_spinbox.setRange(0, 255)
+            max2_spinbox.setValue(max2_slider.value())
+            
+            # Sincronização bidirecional
+            max2_slider.valueChanged.connect(max2_spinbox.setValue)
+            max2_spinbox.valueChanged.connect(max2_slider.setValue)
+            
+            # Layout horizontal para slider e spinbox
+            max2_layout = QHBoxLayout()
+            max2_layout.addWidget(max2_slider)
+            max2_layout.addWidget(max2_spinbox)
+            
             layout.addWidget(max2_label)
-            layout.addWidget(max2_slider)
+            layout.addLayout(max2_layout)
 
             fig_prev, (ax_prev1, ax_prev2) = plt.subplots(
                 1, 2, figsize=(12, 5))
@@ -1583,7 +1677,16 @@ class UrbanChangeAid:
         layout.addWidget(QLabel("Loss Threshold:"))
         layout.addWidget(thresh_loss_spin)
 
-        apply_button = QPushButton("Apply")
+        # Sieve threshold for cleaning isolated pixels
+        layout.addWidget(QLabel("\nSieve Settings (for cleaning masks):"))
+        sieve_threshold_spin = QSpinBox()
+        sieve_threshold_spin.setRange(1, 1000)
+        sieve_threshold_spin.setValue(8)
+        sieve_threshold_spin.setToolTip("Minimum number of connected pixels to keep. Smaller groups will be removed.")
+        layout.addWidget(QLabel("Sieve Threshold (pixels):"))
+        layout.addWidget(sieve_threshold_spin)
+
+        apply_button = QPushButton("Generate Masks")
 
         def apply_and_close():
             self.generateMasks_with_params(
@@ -1594,6 +1697,19 @@ class UrbanChangeAid:
 
         apply_button.clicked.connect(apply_and_close)
         layout.addWidget(apply_button)
+
+        # Button to apply sieve to already generated masks
+        apply_sieve_button = QPushButton("Clean Isolated Pixels (Apply Sieve)")
+        apply_sieve_button.setToolTip("Remove small isolated pixel groups from the generated masks")
+
+        def apply_sieve_and_close():
+            self.apply_sieve_to_masks(
+                threshold=sieve_threshold_spin.value(),
+                connectivity=8
+            )
+
+        apply_sieve_button.clicked.connect(apply_sieve_and_close)
+        layout.addWidget(apply_sieve_button)
 
         dialog.setLayout(layout)
         dialog.exec_()
