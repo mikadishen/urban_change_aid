@@ -1,6 +1,5 @@
 Urban Change Aid - Plugin QGIS para Detecção de Mudanças Urbanas
 
-
 O Urban Change Aid é um plugin QGIS poderoso e semi-automatizado, projetado para transformar a análise de imagens de satélite em insights concretos sobre a expansão, emergência ou supressão de construções urbanas.
 
 Identifique mudanças em minutos usando técnicas de sensoriamento remoto como normalização, binarização, filtros geométricos e mapas de calor. Exporte resultados vetorizados prontos para qualquer análise espacial.
