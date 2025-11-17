@@ -12,6 +12,7 @@ about=Urban Change AID provides an integrated workflow for detecting, mapping, a
 
 tracker=https://github.com/leandrosgregorio/urban-change-aid/issues
 repository=https://github.com/leandrosgregorio/urban-change-aid
+website:https://urbanchang-gb98hazp.manus.space/
 
 license=GPL-3
 license_file=LICENSE
