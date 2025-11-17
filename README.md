@@ -65,8 +65,25 @@ Follow these steps to install and configure Urban Change Aid in QGIS.
 
 1. Install QGIS: Download and install QGIS version 3.40 LTR (Long Term Release) from the official website.
 
-2. Install Orfeo Toolbox (OTB): Download the OTB for your operating system and extract it to an easily accessible directory, for example, C:/o
+2. Install Orfeo Toolbox (OTB): Download OTB for your operating system and extract it to an easily accessible directory, for example, C:/otb910.
 
+3. Install the Plugin: Extract the plugin's ZIP file to the QGIS plugin directory: C:\Users\your_username\AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins\urban_change_aid
+
+4. Configure OTB in QGIS: In QGIS, go to Options → Processing → Providers → OTB and configure:
+
+• OTB application folder: C:/otb910/lib/otb/applications
+
+• OTB folder: C:/otb910
+
+5. Load the Plugin: Install the Plugin Reloader from the QGIS plugin repository and use it to reload Urban Change Aid. If successful, the plugin will appear in the Plugins menu.
+
+🚀 Ready to Transform Your Urban Analysis?
+
+Download Urban Change Aid and start detecting urban changes with targeted, metrics-driven workflows.
+
+Technical Specification Details Version QGIS 3.40 LTR onwards License GNU GPL v3 Language Python 
+[[Link to GitHub]](https://github.com/mikadishen/urban_change_aid/)
+[[Link to WebSite]](https://urbanchang-gb98hazp.manus.space)
 -------------------
 Portuguese: (PT-BR)
 Urban Change Aid - Plugin QGIS para Detecção de Mudanças Urbanas
