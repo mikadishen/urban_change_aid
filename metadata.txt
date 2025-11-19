@@ -1,5 +1,21 @@
-# This file contains metadata for your plugin.
-# It must be included when you package your plugin.
+# -*- coding: utf-8 -*-
+# Urban Change AID
+# QGIS plugin for detecting and analyzing urban changes using satellite/aerial imagery and AI-assisted metrics
+#
+# Copyright (C) 2025 Leandro da Silva Gregorio
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 [general]
 name=Urban Change AID
@@ -12,7 +28,7 @@ about=Urban Change AID provides an integrated workflow for detecting, mapping, a
 
 tracker=https://github.com/leandrosgregorio/urban-change-aid/issues
 repository=https://github.com/leandrosgregorio/urban-change-aid
-homepage=https://urbanchang-gb98hazp.manus.space/
+homepage=https://github.com/leandrosgregorio/urban-change-aid
 
 license=GPL-3
 license_file=LICENSE
