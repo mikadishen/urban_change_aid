@@ -85,6 +85,7 @@ Technical Specification Details Version QGIS 3.40 LTR onwards License GNU GPL v3
 [[Link to GitHub]](https://github.com/mikadishen/urban_change_aid/)
 [[Link to WebSite]](https://urbanchang-gb98hazp.manus.space)
 -------------------
+
 Portuguese: (PT-BR)
 Urban Change Aid - Plugin QGIS para Detecção de Mudanças Urbanas
 
@@ -176,6 +177,7 @@ Especificação Técnica
 Detalhe
 Versão QGIS
 3.40 LTR em diante
+10.5281/zenodo.1765535
 Licença
 GNU GPL v3
 Linguagem
