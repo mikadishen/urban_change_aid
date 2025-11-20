@@ -26,9 +26,9 @@ author=Leandro da Silva Gregorio
 email=leandrogeosmart@gmail.com
 about=Urban Change AID provides an integrated workflow for detecting, mapping, and analyzing urban changes across two dates. It includes tools for image alignment, spectral band extraction, normalization, thresholding, difference calculation, mask generation, vectorization, and spatial metrics computation. Designed for satellite or aerial imagery, the plugin features an intuitive tabbed interface that guides the user through each stage of the process.
 
-tracker=https://github.com/leandrosgregorio/urban-change-aid/issues
-repository=https://github.com/leandrosgregorio/urban-change-aid
-homepage=https://github.com/leandrosgregorio/urban-change-aid
+tracker=https://github.com/mikadishen/urban_change_aid/issues
+repository=https://github.com/mikadishen/urban_change_aid
+homepage=https://github.com/mikadishen/urban_change_aid
 
 license=GPL-3
 license_file=LICENSE
