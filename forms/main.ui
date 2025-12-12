@@ -399,13 +399,6 @@
         </widget>
        </item>
        <item>
-        <widget class="QPushButton" name="previewVectors">
-         <property name="text">
-          <string>Preview Vectors</string>
-         </property>
-        </widget>
-       </item>
-       <item>
         <widget class="QPushButton" name="btnReprojectUTM">
          <property name="text">
           <string>Reproject to UTM</string>
@@ -482,7 +475,14 @@
         </widget>
        </item>
        <item>
-        <widget class="QPushButton" name="export_all">
+        <widget class="QPushButton" name="generate_heatmaps_btn">
+         <property name="text">
+          <string>Generate Heatmaps</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="export_all_results_btn">
          <property name="text">
           <string>Export All Results</string>
          </property>
