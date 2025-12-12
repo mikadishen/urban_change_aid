@@ -1,6 +1,6 @@
 from PyQt5.QtCore import QTimer  # Adicione isso no top, após imports Qt
 from PyQt5.QtWidgets import (QLabel, QTabWidget, QWidget, QVBoxLayout,
-                             QHBoxLayout, QSlider, QSpinBox, QDoubleSpinBox, QPushButton, QDialog, QGridLayout, QScrollArea)
+                             QHBoxLayout, QSlider, QSpinBox, QDoubleSpinBox, QPushButton, QDialog, QGridLayout, QScrollArea, QComboBox)
 from PyQt5 import uic
 from qgis.PyQt.QtWidgets import QApplication
 from datetime import datetime
@@ -12,6 +12,7 @@ from sklearn.decomposition import PCA
 import cv2
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 import matplotlib.pyplot as plt
 from scipy import ndimage as ndi
 from qgis.utils import iface
@@ -24,7 +25,7 @@ from qgis.core import (
     QgsRasterLayer, QgsProject, QgsVectorLayer, QgsFeature, QgsGeometry, QgsField,
     QgsRasterShader, QgsColorRampShader, QgsSingleBandPseudoColorRenderer,
     QgsRectangle, QgsCoordinateReferenceSystem, QgsPointXY, Qgis, QgsMapLayer,
-    QgsVectorFileWriter, QgsMessageLog, QgsSingleBandGrayRenderer, QgsWkbTypes, )
+    QgsVectorFileWriter, QgsMessageLog, QgsSingleBandGrayRenderer, QgsWkbTypes, QgsApplication)
 
 from qgis.core import QgsDistanceArea, QgsCoordinateTransform, QgsCoordinateReferenceSystem
 from qgis.PyQt.QtCore import QVariant, Qt, pyqtSignal
@@ -32,6 +33,20 @@ from qgis.PyQt.QtGui import QIcon, QColor
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QDoubleSpinBox, QPushButton, QSlider, QRadioButton, QSpinBox, QGroupBox, QCheckBox
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.core import QgsProcessingAlgorithm
+from shapely.geometry import (
+    GeometryCollection,
+    LinearRing,
+    LineString,
+    MultiPolygon,
+    Polygon,
+)
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
+from scipy.optimize import brentq
+from shapely import make_valid
+# Importa o carregador WKT da Shapely
+from shapely.wkt import loads as shapely_loads
+import numpy as np
 from qgis.core import QgsProcessingMultiStepFeedback
 from qgis.core import QgsProcessingParameterRasterLayer
 from qgis.core import QgsProcessingParameterNumber
@@ -93,6 +108,11 @@ class UrbanChangeAid:
         self.register_sieve_algorithm()
         self.log_message("Sieve algorithm registered.")
 
+        # NOTE: Removed defensive stub for `export_all_results` that could
+        # unintentionally shadow the real implementation defined later in
+        # this class. The real method is declared further below and should
+        # be used by UI signal connections.
+
     def register_sieve_algorithm(self):
         """Temporarily disabled until UrbanChangeAidProvider is implemented."""
         QgsMessageLog.logMessage(
@@ -126,14 +146,16 @@ class UrbanChangeAid:
         self.bin_year1_path = None
         self.bin_year2_path = None
         self.difference_path = None  # Adicione esta linha aqui
-        export_all_results = None
         self.gain_mask_path = None
         self.loss_mask_path = None
         self.gain_vector_path = None
         self.loss_vector_path = None
         self.filtered_gain_vector = None
         self.filtered_loss_vector = None
-        self.centroids_path = None
+        # path for centroids generated for export/analysis
+        self.export_centroids_path = None
+        self.smoothed_gain_vector_path = None
+        self.smoothed_loss_vector_path = None
         self.selected_crop_bounds = None
 
         self.selected_layer = None
@@ -169,6 +191,291 @@ class UrbanChangeAid:
     def tr(self, message):
         return QCoreApplication.translate('UrbanChangeAid', message)
 
+
+    def generate_heatmaps(self):
+        """Gera heatmaps a partir do vetor de perda suavizado (se disponível) ou de qualquer camada de pontos carregada no projeto, com escolha do usuário."""
+        try:
+            # 1. Busca todas as camadas de pontos (vetoriais) no projeto
+            # A verificação de geometria é feita de forma mais robusta para incluir camadas que podem ter QgsWkbTypes.Unknown
+            # mas que são de fato pontos (como as recém-criadas).
+            point_layers = []
+            for layer in QgsProject.instance().mapLayers().values():
+                if layer.type() == QgsMapLayer.VectorLayer:
+                    # Verifica se é Point ou se é Unknown/NoGeometry mas tem um provedor de dados
+                    # A verificação mais robusta é: se for Point, ou se for Unknown mas tiver um provedor de dados (o que sugere que é um layer válido)
+                    geom_type = layer.geometryType()
+                    if geom_type == QgsWkbTypes.Point or geom_type == QgsWkbTypes.PointZ or geom_type == QgsWkbTypes.PointM or geom_type == QgsWkbTypes.PointZM:
+                        point_layers.append(layer)
+                    elif geom_type == QgsWkbTypes.Unknown and layer.dataProvider() is not None:
+                        # Tenta inferir o tipo de geometria se for Unknown (pode ser um layer temporário)
+                        # No entanto, para Heatmap, é crucial que seja Point. Vamos manter a verificação estrita,
+                        # mas garantindo que todos os tipos de Point sejam considerados.
+                        # A falha pode estar na inicialização do layer.
+                        # Vamos manter a checagem estrita, mas o problema pode ser que os layers do usuário não são Point, mas sim MultiPoint,
+                        # ou o QGIS não está reconhecendo o tipo WKB.
+                        # O mais provável é que os layers do usuário sejam MultiPoint.
+                        if layer.wkbType() in [QgsWkbTypes.MultiPoint, QgsWkbTypes.MultiPointZ, QgsWkbTypes.MultiPointM, QgsWkbTypes.MultiPointZM]:
+                            point_layers.append(layer)
+                        # Se o layer for Point ou MultiPoint, ele é adicionado.
+                        elif geom_type == QgsWkbTypes.Unknown:
+                            # Se for Unknown, vamos inspecionar a primeira feature para ver se é Point.
+                            try:
+                                first_feature = next(layer.getFeatures())
+                                if first_feature.geometry().wkbType() in [QgsWkbTypes.Point, QgsWkbTypes.PointZ, QgsWkbTypes.PointM, QgsWkbTypes.PointZM, QgsWkbTypes.MultiPoint, QgsWkbTypes.MultiPointZ, QgsWkbTypes.MultiPointM, QgsWkbTypes.MultiPointZM]:
+                                    point_layers.append(layer)
+                            except StopIteration:
+                                # Layer vazio, ignora
+                                pass
+                            except Exception:
+                                # Erro ao ler feature, ignora
+                                pass
+            
+            # Remove duplicatas e layers inválidos
+            point_layers = list(set(point_layers))
+            point_layers = [layer for layer in point_layers if layer.isValid()]
+
+            # Adiciona o vetor de perda suavizado (se existir) à lista de camadas disponíveis, se ainda não estiver no projeto
+            smoothed_loss_layer = None
+            if self.smoothed_loss_vector_path and os.path.exists(self.smoothed_loss_vector_path):
+                # Cria uma referência temporária para o layer
+                smoothed_loss_layer = QgsVectorLayer(
+                    self.smoothed_loss_vector_path, "Centroids Loss Smoothed (Auto)", "ogr")
+                
+                # Verifica se o layer já está na lista (pelo nome ou fonte)
+                is_already_in_project = any(
+                    layer.source() == smoothed_loss_layer.source() for layer in point_layers)
+                
+                if smoothed_loss_layer.isValid() and smoothed_loss_layer.geometryType() == QgsWkbTypes.Point and not is_already_in_project:
+                    # Adiciona o layer temporário para que o usuário possa selecioná-lo
+                    point_layers.insert(0, smoothed_loss_layer)
+                    self.log_message("Added smoothed loss vector to selection list.")
+                elif is_already_in_project:
+                    # Se já estiver no projeto, apenas o encontra para pré-seleção
+                    smoothed_loss_layer = next((layer for layer in point_layers if layer.source() == smoothed_loss_layer.source()), None)
+
+            if not point_layers:
+                QMessageBox.warning(self.dialog, "Warning",
+                                    "No point vector layers found in the project. Load a centroid layer first.")
+                self.log_message("No point layers found for heatmap generation.")
+                return
+
+            # 2. Diálogo para seleção da camada e parâmetros
+            from qgis.PyQt.QtWidgets import QDialogButtonBox, QComboBox, QDoubleSpinBox, QLabel, QVBoxLayout, QHBoxLayout
+            choice_dlg = QDialog(self.dialog)
+            choice_dlg.setWindowTitle("Generate Heatmap from Centroids")
+            choice_layout = QVBoxLayout(choice_dlg)
+
+            # Seletor de Camada
+            layer_box = QHBoxLayout()
+            layer_lbl = QLabel("Select Centroid Layer:")
+            layer_combo = QComboBox()
+            
+            # Variável para rastrear o índice do layer de perda suavizado para pré-seleção
+            pre_select_index = -1
+            
+            for i, layer in enumerate(point_layers):
+                layer_combo.addItem(layer.name(), layer)
+                # Usa a fonte para garantir que o layer de perda suavizado seja pré-selecionado
+                if smoothed_loss_layer and layer.source() == smoothed_loss_layer.source():
+                    pre_select_index = i
+            
+            if pre_select_index != -1:
+                layer_combo.setCurrentIndex(pre_select_index)
+
+            layer_box.addWidget(layer_lbl)
+            layer_box.addWidget(layer_combo)
+            choice_layout.addLayout(layer_box)
+
+            # Raio
+            radius_box = QHBoxLayout()
+            radius_lbl = QLabel("Kernel Radius (map units, e.g., meters):")
+            radius_spin = QDoubleSpinBox()
+            radius_spin.setRange(1, 100000)
+            radius_spin.setValue(1000)
+            radius_spin.setSingleStep(100)
+            radius_box.addWidget(radius_lbl)
+            radius_box.addWidget(radius_spin)
+            choice_layout.addLayout(radius_box)
+
+            # Botões OK/Cancel
+            btn_layout = QHBoxLayout()
+            ok_btn = QPushButton("Generate Heatmap")
+            cancel_btn = QPushButton("Cancel")
+            btn_layout.addWidget(ok_btn)
+            btn_layout.addWidget(cancel_btn)
+            choice_layout.addLayout(btn_layout)
+
+            def generate_selected():
+                selected_layer = layer_combo.currentData()
+                radius = radius_spin.value()
+
+                if not selected_layer:
+                    QMessageBox.warning(choice_dlg, "Warning", "Please select a layer.")
+                    return
+
+                if selected_layer.featureCount() == 0:
+                    QMessageBox.warning(choice_dlg, "Warning", f"Layer '{selected_layer.name()}' has no features.")
+                    return
+
+                try:
+                    # Define o caminho de saída
+                    layer_name_safe = selected_layer.name().replace(' ', '_').replace('/', '_')
+                    heatmap_path = os.path.join(
+                        self.temp_dir, f"{layer_name_safe}_heatmap.tif")
+
+                    # Parâmetros do algoritmo de Heatmap
+                    params = {
+                        'INPUT': selected_layer,
+                        'RADIUS': radius,
+                        'PIXEL_SIZE': 10,  # Ajuste para resolução desejada
+                        'KERNEL': 0,  # Quartic (default)
+                        'OUTPUT': heatmap_path
+                    }
+
+                    # Executa o processamento
+                    result = processing.run(
+                        "qgis:heatmapkerneldensityestimation", params)
+                    out_path = result.get('OUTPUT') or result.get(
+                        'OUTPUT_RASTER') or result.get('OUTPUT_LAYER')
+
+                    if out_path:
+                        # Carrega o resultado no projeto
+                        heatmap_layer = QgsRasterLayer(
+                            out_path, f"Heatmap - {selected_layer.name()}")
+                        if heatmap_layer.isValid():
+                            QgsProject.instance().addMapLayer(heatmap_layer)
+                            self.log_message(
+                                f"✅ Heatmap generated from '{selected_layer.name()}' ({radius}m radius) and loaded in project.")
+                            QMessageBox.information(
+                                self.dialog, "Success", f"Heatmap generated and loaded from '{selected_layer.name()}'.")
+                        else:
+                            self.log_message(
+                                "Warning: Invalid Heatmap layer.")
+                            QMessageBox.warning(
+                                self.dialog, "Error", "Failed to load generated Heatmap layer.")
+                    else:
+                        self.log_message("Error: Heatmap algorithm did not return an output path.")
+                        QMessageBox.warning(
+                            self.dialog, "Error", "Heatmap generation failed.")
+
+                    choice_dlg.accept()
+
+                except Exception as e:
+                    self.log_message(f"Error generating heatmap: {str(e)}")
+                    QMessageBox.warning(self.dialog, "Error",
+                                        f"Error generating heatmap: {str(e)}")
+
+            ok_btn.clicked.connect(generate_selected)
+            cancel_btn.clicked.connect(choice_dlg.reject)
+            
+            choice_dlg.exec_()
+
+        except Exception as e:
+            self.log_message(f"Error in generate_heatmaps: {str(e)}")
+            QMessageBox.warning(self.dialog, "Error",
+                                f"Error generating heatmaps: {str(e)}")
+
+
+    def _safe_layer_source(self, layer: QgsVectorLayer) -> str:
+        try:
+            src = layer.source()
+            if '|' in src:
+                src = src.split('|')[0]
+            return src
+        except Exception:
+            return ''
+
+    def export_all_results(self):
+        """Exporta todos os resultados do diretório temporário para um diretório escolhido, com opção de selecionar o que salvar."""
+        export_dir = QFileDialog.getExistingDirectory(
+            self.dialog, "Select Output Directory for All Results")
+        if not export_dir:
+            return
+
+        try:
+            # Lista todos os arquivos no temp_dir (filtros para .shp, .tif, etc.)
+            files_in_temp = [f for f in os.listdir(
+                self.temp_dir) if os.path.isfile(os.path.join(self.temp_dir, f))]
+            if not files_in_temp:
+                self.log_message("No files found in temp directory to export.")
+                QMessageBox.information(
+                    self.dialog, "Info", "No files available in temp directory.")
+                return
+
+            # Cria dialog para seleção (com checkboxes)
+            select_dlg = QDialog(self.dialog)
+            select_dlg.setWindowTitle("Select Files to Export")
+            # ← FIX: Modal pra não sumir ao clicar fora, bloqueia só o parent
+            select_dlg.setWindowModality(Qt.WindowModal)
+            select_dlg.resize(800, 400)  # ← NOVO: Tamanho maior pra não cortar
+            select_layout = QVBoxLayout(select_dlg)
+
+            # Grupo com checkboxes em grid horizontal (pra não cortar vertical)
+            group_box = QGroupBox("Select files from temp:")
+            # ← FIX: QGridLayout pra disposição horizontal (3 colunas, ajustável)
+            group_layout = QGridLayout(group_box)
+            checkboxes = []
+            num_columns = 3  # Colunas pra wrap horizontal
+            for i, file in enumerate(files_in_temp):
+                chk = QCheckBox(file)
+                chk.setChecked(True)  # Todos selecionados por default
+                row = i // num_columns
+                col = i % num_columns
+                group_layout.addWidget(chk, row, col)
+                checkboxes.append(chk)
+
+            # Scroll se muitos arquivos
+            scroll_area = QScrollArea()
+            scroll_area.setWidget(group_box)
+            scroll_area.setWidgetResizable(True)
+            select_layout.addWidget(scroll_area)
+
+            # Botões OK/Cancel
+            btn_layout = QHBoxLayout()
+            ok_btn = QPushButton("Export Selected")
+            cancel_btn = QPushButton("Cancel")
+            btn_layout.addWidget(ok_btn)
+            btn_layout.addWidget(cancel_btn)
+            select_layout.addLayout(btn_layout)
+
+            def export_selected():
+                selected_files = [chk.text()
+                                  for chk in checkboxes if chk.isChecked()]
+                if not selected_files:
+                    QMessageBox.warning(
+                        select_dlg, "Warning", "No files selected.")
+                    return
+
+                exported_count = 0
+                for file in selected_files:
+                    src_path = os.path.join(self.temp_dir, file)
+                    dest_path = os.path.join(export_dir, file)
+                    try:
+                        # Copia o arquivo (simples, pra qualquer tipo)
+                        shutil.copy(src_path, dest_path)
+                        self.log_message(f"Exported {file} to {dest_path}")
+                        exported_count += 1
+                    except Exception as copy_e:
+                        self.log_message(
+                            f"Error copying {file}: {str(copy_e)}")
+
+                self.log_message(
+                    f"All selected results ({exported_count}) exported successfully.")
+                QMessageBox.information(
+                    self.dialog, "Success", f"Selected files exported to {export_dir}")
+                select_dlg.accept()
+
+            ok_btn.clicked.connect(export_selected)
+            cancel_btn.clicked.connect(select_dlg.reject)
+
+            select_dlg.exec_()  # Modal exec pra ficar aberto até OK/Cancel
+
+        except Exception as e:
+            self.log_message(f"Error exporting all results: {str(e)}")
+            QMessageBox.warning(self.dialog, "Error",
+                                f"Error exporting all results: {str(e)}")
+
+
     def initGui(self):
         icon_path = os.path.join(
             self.plugin_dir, "icons", "urban_icon_house.png")
@@ -188,33 +495,8 @@ class UrbanChangeAid:
             try:
                 self.dialog = uic.loadUi(ui_path)
 
-                # Adicione isso no método run(self), após carregar o UI e antes dos connects (depois de self.dialog = uic.loadUi(ui_path))
-                # Encontra o tab Centroids (índice 9, ajuste se necessário)
-                centroids_tab = self.dialog.tabWidget.widget(
-                    9)  # Índice do tab "Centroids & Export"
-                if centroids_tab:
-                    layout = centroids_tab.layout()  # Assume QVBoxLayout já existe no tab
-                    if layout:
-                        # Adiciona botão "Generate Heatmaps"
-                        generate_heatmaps_btn = QPushButton(
-                            "Generate Heatmaps from Centroids")
-                        # Insere no topo do layout
-                        layout.insertWidget(0, generate_heatmaps_btn)
-                        # conecta somente se o método existir para evitar exceptions em tempo de execução
-                        if hasattr(self, 'generate_heatmaps'):
-                            generate_heatmaps_btn.clicked.connect(
-                                self.generate_heatmaps)
-                            self.log_message(
-                                "Added 'Generate Heatmaps' button to Centroids tab.")
-                        else:
-                            self.log_message(
-                                "Generate heatmaps method not found; button added without connection.")
-                    else:
-                        self.log_message(
-                            "Warning: No layout found in Centroids tab — button not added.")
-                else:
-                    self.log_message(
-                        "Warning: Centroids tab not found — button not added.")
+                # REMOVIDO: Código de adição dinâmica do botão de heatmap para resolver a duplicação.
+                # O botão de heatmap deve ser definido no .ui e conectado a self.generate_heatmaps.
 
                 # preenche combos com camadas vetoriais já no projeto (se houver)
                 # self.populate_vector_combos()
@@ -227,7 +509,7 @@ class UrbanChangeAid:
                         self.on_generate_gain_loss_clicked)
                 else:
                     QMessageBox.warning(
-                        self.dialog, "Erro", "Botão 'Generate Masks' não encontrado na interface.")
+                        self.dialog, "Error", "Button 'Generate Masks' not found in the UI.")
 
                 # logTextEdit
                 if hasattr(self.dialog, 'logTextEdit'):
@@ -273,6 +555,18 @@ class UrbanChangeAid:
             # Conecta sinais
             self.connect_signals()
 
+            # Conexão do botão de Heatmap (Problema 1)
+            # O botão deve ser conectado em connect_signals para evitar duplicação e garantir que o nome correto seja usado.
+            # Este bloco é removido.
+
+            # Conexão do botão Export All Results (Problema 2)
+            export_btn = self.dialog.findChild(QPushButton, "export_all_results_btn")
+            if export_btn:
+                export_btn.clicked.connect(self.export_all_results)
+                self.log_message("Connected 'Export All Results' button (export_all_results_btn).")
+            else:
+                self.log_message("Warning: 'export_all_results_btn' not found in UI for connection.")
+
             if hasattr(self.dialog, 'previewBandsButton'):
                 self.dialog.previewBandsButton.clicked.connect(
                     self.open_band_preview_dialog)
@@ -281,6 +575,13 @@ class UrbanChangeAid:
             if hasattr(self.dialog, 'nextToSieve'):
                 self.dialog.nextToSieve.clicked.connect(self.next_to_sieve)
 
+            # Cria a aba Smoothify (será inserida na posição 9)
+                # Cria a nova aba Orthogonalize & Simplify (índice 8)
+                self.create_orthogonalize_tab()
+                # Cria a aba Smoothify (índice 9)
+                self.create_smoothify_tab()
+
+            # Desabilita todas as abas, exceto a primeira (Input Images)
             for i in range(1, self.dialog.tabWidget.count()):
                 self.dialog.tabWidget.setTabEnabled(i, False)
 
@@ -288,6 +589,261 @@ class UrbanChangeAid:
 
         # sempre mostra a janela no final
         self.dialog.show()
+
+    def create_smoothify_tab(self):
+        """Cria e insere a nova aba Smoothify na posição 9."""
+        tab_smoothify = QWidget()
+        tab_smoothify.setObjectName("tabSmoothify")
+        tab_smoothify.setWindowTitle("Smoothify")
+
+        layout = QVBoxLayout(tab_smoothify)
+
+        # Parâmetros de Smoothify
+        smooth_iterations_spin = QSpinBox()
+        smooth_iterations_spin.setRange(1, 10)
+        smooth_iterations_spin.setValue(3)
+        smooth_iterations_spin.setObjectName("smoothIterationsSpin")
+
+        segment_length_spin = QDoubleSpinBox()
+        segment_length_spin.setRange(0.1, 100.0)
+        segment_length_spin.setValue(1.0)
+        segment_length_spin.setDecimals(2)
+        segment_length_spin.setObjectName("segmentLengthSpin")
+
+        preserve_area_check = QCheckBox("Preservar Área (Polygons)")
+        preserve_area_check.setChecked(True)
+        preserve_area_check.setObjectName("preserveAreaCheck")
+
+        area_tolerance_spin = QDoubleSpinBox()
+        area_tolerance_spin.setRange(0.001, 1.0)
+        area_tolerance_spin.setValue(0.01)
+        area_tolerance_spin.setDecimals(3)
+        area_tolerance_spin.setObjectName("areaToleranceSpin")
+
+        # Botão de processamento
+        btn_smoothify = QPushButton("Apply Smoothify and Load Vectors")
+        btn_smoothify.setObjectName("btnSmoothify")
+        btn_smoothify.clicked.connect(self.apply_smoothify)
+
+        # Layout de parâmetros
+        param_layout = QGridLayout()
+        param_layout.addWidget(
+            QLabel("Iterações de Suavização (Chaikin):"), 0, 0)
+        param_layout.addWidget(smooth_iterations_spin, 0, 1)
+        param_layout.addWidget(
+            QLabel("Comprimento do Segmento (Unidades de Mapa):"), 1, 0)
+        param_layout.addWidget(segment_length_spin, 1, 1)
+        param_layout.addWidget(preserve_area_check, 2, 0, 1, 2)
+        param_layout.addWidget(QLabel("Tolerância de Área (%):"), 3, 0)
+        param_layout.addWidget(area_tolerance_spin, 3, 1)
+
+        layout.addLayout(param_layout)
+        layout.addWidget(btn_smoothify)
+        layout.addStretch()
+
+        # Insere a aba na posição 10 (após Orthogonalize & Simplify, que é 9)
+        self.dialog.tabWidget.insertTab(10, tab_smoothify, "Smoothify")
+
+        # Adiciona botões de navegação
+        nav_layout = QHBoxLayout()
+        prev_btn = QPushButton("Previous")
+        next_btn = QPushButton("Next")
+        nav_layout.addWidget(prev_btn)
+        nav_layout.addStretch()
+        nav_layout.addWidget(next_btn)
+        layout.addLayout(nav_layout)
+
+        # Conecta os botões de navegação: voltar para Orthogonalize e avançar para Centroids
+        # Volta para Orthogonalize & Simplify (índice 9)
+        prev_btn.clicked.connect(
+            lambda: self.dialog.tabWidget.setCurrentIndex(9))
+        # Avança para Centroid_Export (opcional)
+        next_btn.clicked.connect(self.next_to_centroids)
+
+    def create_orthogonalize_tab(self):
+        """Cria e insere a nova aba Orthogonalize & Simplify na posição 9 (antes de Smoothify)."""
+        tab_ortho = QWidget()
+        tab_ortho.setObjectName("tabOrthogonalize")
+        tab_ortho.setWindowTitle("Orthogonalize & Simplify")
+
+        layout = QVBoxLayout(tab_ortho)
+
+        # Descrição e Instruções
+        desc_label = QLabel(
+            "Use this tab to simplify or orthogonalize the filtered vectors (gain_filtered.shp and loss_filtered.shp) before applying Smoothify or generating Centroids.")
+        desc_label.setWordWrap(True)
+        layout.addWidget(desc_label)
+
+        # Componentes de UI para Orthogonalize/Simplify (baseado em on_orthogonalize_or_simplify_button_clicked)
+        # Input Layer (ComboBox) - Será populado dinamicamente ou simplificado para usar os arquivos temporários
+        # Por simplicidade, vamos usar um botão que abre o diálogo existente (que já tem a lógica de UI complexa)
+        # e ajustamos o fluxo para que ele não feche o diálogo principal.
+
+        # Botão para abrir o diálogo de Orthogonalize/Simplify
+        btn_open_dialog = QPushButton("Open Simplify/Orthogonalize Dialog")
+        btn_open_dialog.setObjectName("btnOpenOrthoDialog")
+        # Conecta ao método que abre o diálogo (o método existente será renomeado/adaptado)
+        btn_open_dialog.clicked.connect(
+            self.on_orthogonalize_or_simplify_button_clicked)
+        layout.addWidget(btn_open_dialog)
+
+        # Insere a aba na posição 9 (após Metrics Filter, que é 8, se Vectorization for 7)
+        # Assumindo que Metrics Filter é 8 e Vectorization é 7, a ordem correta é Vectorization(7) > Metrics_Filtering(8) > Ortogonalize_Simplify(9)
+        self.dialog.tabWidget.insertTab(
+            9, tab_ortho, "Orthogonalize & Simplify")
+
+        # Adiciona botões de navegação
+        nav_layout = QHBoxLayout()
+        prev_btn = QPushButton("Previous")
+        next_btn = QPushButton("Next")
+        nav_layout.addWidget(prev_btn)
+        nav_layout.addStretch()
+        nav_layout.addWidget(next_btn)
+        layout.addLayout(nav_layout)
+
+        # Conecta os botões
+        # A aba anterior a 8 (Orthogonalize) é 7 (Metrics Filter)
+        # Volta para Metrics Filter (índice 8)
+        prev_btn.clicked.connect(
+            lambda: self.dialog.tabWidget.setCurrentIndex(8))
+        # Avança para Centroid_Export (opcional)
+        next_btn.clicked.connect(self.next_to_centroids)
+
+    def next_to_metrics_filter(self):
+        """Avança para o próximo tab: Metrics Filter (movimenta relativo ao tab atual)."""
+        try:
+            tw = getattr(self.dialog, 'tabWidget', None)
+            if not tw:
+                return
+            cur = tw.currentIndex()
+            if cur + 1 < tw.count():
+                tw.setTabEnabled(cur + 1, True)
+                tw.setCurrentIndex(cur + 1)
+                self.log_message(
+                    f"➡️ Moved to Metrics Filter tab (index {cur+1}).")
+        except Exception as e:
+            self.log_message(f"Error advancing to Metrics Filter tab: {e}")
+            try:
+                QMessageBox.warning(self.dialog, "Error",
+                                    f"Error advancing: {e}")
+            except Exception:
+                pass
+
+    def next_to_orthogonalize(self):
+        """Avança para a aba Orthogonalize & Simplify (relativo ao atual)."""
+        try:
+            tw = getattr(self.dialog, 'tabWidget', None)
+            if not tw:
+                return
+            cur = tw.currentIndex()
+            if cur + 1 < tw.count():
+                tw.setTabEnabled(cur + 1, True)
+                tw.setCurrentIndex(cur + 1)
+                self.log_message(
+                    f"➡️ Moved to Orthogonalize & Simplify tab (index {cur+1}).")
+        except Exception as e:
+            self.log_message(
+                f"Error advancing to Orthogonalize & Simplify tab: {e}")
+            try:
+                QMessageBox.warning(self.dialog, "Error",
+                                    f"Error advancing: {e}")
+            except Exception:
+                pass
+
+    def next_to_smoothify(self):
+        """Avança para a aba Smoothify (relativo ao atual). Verifica se existem vetores filtrados antes."""
+        try:
+            gain_exists = bool(getattr(self, 'filtered_gain_vector', None) and os.path.exists(
+                getattr(self, 'filtered_gain_vector')))
+            loss_exists = bool(getattr(self, 'filtered_loss_vector', None) and os.path.exists(
+                getattr(self, 'filtered_loss_vector')))
+            if not (gain_exists or loss_exists):
+                QMessageBox.warning(
+                    self.dialog, "Warning", "Please export filtered vectors (Gain/Loss) first or run Metrics Filter before Smoothify.")
+                return
+
+            tw = getattr(self.dialog, 'tabWidget', None)
+            if not tw:
+                return
+            cur = tw.currentIndex()
+            if cur + 1 < tw.count():
+                tw.setTabEnabled(cur + 1, True)
+                tw.setCurrentIndex(cur + 1)
+                self.log_message(f"➡️ Moved to Smoothify tab (index {cur+1}).")
+        except Exception as e:
+            self.log_message(f"Error advancing to Smoothify tab: {e}")
+            try:
+                QMessageBox.warning(self.dialog, "Error",
+                                    f"Error advancing: {e}")
+            except Exception:
+                pass
+
+    def next_to_centroids(self):
+        """Avança para a aba Centroids (relativo ao atual)."""
+        try:
+            tw = getattr(self.dialog, 'tabWidget', None)
+            if not tw:
+                return
+            cur = tw.currentIndex()
+            if cur + 1 < tw.count():
+                tw.setTabEnabled(cur + 1, True)
+                tw.setCurrentIndex(cur + 1)
+                self.log_message(f"➡️ Moved to Centroids tab (index {cur+1}).")
+        except Exception as e:
+            self.log_message(f"Error advancing to Centroids tab: {e}")
+            try:
+                QMessageBox.warning(self.dialog, "Error",
+                                    f"Error advancing: {e}")
+            except Exception:
+                pass
+
+    def next_to_export(self):
+        """Avança para a aba Export & Finish (relativo ao atual)."""
+        try:
+            tw = getattr(self.dialog, 'tabWidget', None)
+            if not tw:
+                return
+            cur = tw.currentIndex()
+            if cur + 1 < tw.count():
+                tw.setTabEnabled(cur + 1, True)
+                tw.setCurrentIndex(cur + 1)
+                self.log_message(
+                    f"➡️ Moved to Export & Finish tab (index {cur+1}).")
+        except Exception as e:
+            self.log_message(f"Error advancing to Export & Finish tab: {e}")
+            try:
+                QMessageBox.warning(self.dialog, "Error",
+                                    f"Error advancing: {e}")
+            except Exception:
+                pass
+
+    def next_to_smoothify(self):
+        """Avança para a aba Smoothify (relativo ao atual). Verifica se existem vetores filtrados antes."""
+        try:
+            gain_exists = bool(getattr(self, 'filtered_gain_vector', None) and os.path.exists(
+                getattr(self, 'filtered_gain_vector')))
+            loss_exists = bool(getattr(self, 'filtered_loss_vector', None) and os.path.exists(
+                getattr(self, 'filtered_loss_vector')))
+            if not (gain_exists or loss_exists):
+                QMessageBox.warning(
+                    self.dialog, "Warning", "Please export filtered vectors (Gain/Loss) first or run Metrics Filter before Smoothify.")
+                return
+
+            tw = getattr(self.dialog, 'tabWidget', None)
+            if not tw:
+                return
+            cur = tw.currentIndex()
+            if cur + 1 < tw.count():
+                tw.setTabEnabled(cur + 1, True)
+                tw.setCurrentIndex(cur + 1)
+                self.log_message(f"➡️ Moved to Smoothify tab (index {cur+1}).")
+        except Exception as e:
+            self.log_message(f"Error advancing to Smoothify tab: {e}")
+            try:
+                QMessageBox.warning(self.dialog, "Error",
+                                    f"Error advancing: {e}")
+            except Exception:
+                pass
 
     def show_help(self):
         help_text = (
@@ -323,7 +879,7 @@ class UrbanChangeAid:
             "8. Metrics Filter:\n"
             "   - Calculate Metrics: Computes geometric metrics (area, perimeter, etc.) for each change polygon.\n"
             "   - Filter: Use the sliders to filter polygons based on these metrics, removing undesired shapes (e.g., very thin or very small polygons).\n\n"
-            "9. Centroids & Export:\n"
+            "9. Export & Finish:\n"
             "   - Generate Centroids: Creates a point at the center of each filtered change polygon.\n"
             "   - Generate Heatmaps: Creates heatmaps from centroids to visualize the density of changes.\n"
             "   - Export: Export the final results (filtered vectors, centroids) to formats such as Shapefile or GeoPackage.\n"
@@ -422,9 +978,8 @@ class UrbanChangeAid:
         if hasattr(self.dialog, 'vectorization_export'):
             self.dialog.vectorization_export.clicked.connect(
                 self.vectorize_and_orthogonalize)
-        if hasattr(self.dialog, 'previewVectors'):
-            self.dialog.previewVectors.clicked.connect(
-                self.open_vectors_preview)
+        # Removido a pedido do usuário: Botão Preview Vector
+
         if hasattr(self.dialog, 'btnReprojectUTM'):
             self.dialog.btnReprojectUTM.clicked.connect(
                 self.reproject_gain_loss_to_utm)
@@ -451,7 +1006,7 @@ class UrbanChangeAid:
                 self.open_filtered_preview)
         else:
             self.log_message(
-                "⚠️ Nenhum botão 'Preview' encontrado no UI — verifique o objectName no main.ui")
+                "⚠️ No 'Preview' button found in UI — check the objectName in main.ui")
 
         # Conexões existentes pros sliders (você já tem isso, só pra contexto)
         if hasattr(self.dialog, 'sliderArea'):
@@ -506,16 +1061,269 @@ class UrbanChangeAid:
         if hasattr(self.dialog, 'btnExportSelection'):
             self.dialog.btnExportSelection.clicked.connect(
                 self.export_filtered_vectors)
-        if hasattr(self.dialog, 'nextToCentroids'):
-            self.dialog.nextToCentroids.clicked.connect(self.next_to_centroids)
+
+        if hasattr(self.dialog, 'nextToSmoothify'):
+            self.dialog.nextToSmoothify.clicked.connect(self.next_to_smoothify)
+
+        # Connect orthogonalize/simplify helper button if present (correct objectName)
+        if hasattr(self.dialog, 'orthogonalize_or_simplifyButton'):
+            # Connect to handler that opens helper dialog for simplifying/orthogonalizing
+            # the gain/loss filtered shapefiles located in `self.temp_dir`.
+            # Use a clear handler name and ensure the button is visible.
+            self.dialog.orthogonalize_or_simplifyButton.clicked.connect(
+                self.on_orthogonalize_or_simplify_button_clicked)
+            try:
+                self.dialog.orthogonalize_or_simplifyButton.show()
+            except Exception:
+                pass
+
+        # Rename navigation button to 'nextToExport' if present; keep backward compatibility
+        if hasattr(self.dialog, 'nextToExport'):
+            self.dialog.nextToExport.clicked.connect(self.next_to_export)
+        elif hasattr(self.dialog, 'nextToCentroids'):
+            # backward-compat: connect old name to new handler
+            self.dialog.nextToCentroids.clicked.connect(self.next_to_export)
 
         if hasattr(self.dialog, 'generate_centroids'):
             self.dialog.generate_centroids.clicked.connect(
                 self.generate_centroids)
-        if hasattr(self.dialog, 'export_all'):
-            self.dialog.export_all.clicked.connect(self.export_all_results)
+
+        # Conexão do botão de Heatmap (Problema 1) - Conexão única e correta.
+        # O nome do objeto no .ui deve ser 'generate_heatmaps_btn' ou 'generate_heatmaps'.
+        # Tentamos o nome mais provável que causou a duplicação se não for encontrado.
+        heatmap_btn = self.dialog.findChild(QPushButton, "generate_heatmaps_btn")
+        if not heatmap_btn:
+            heatmap_btn = self.dialog.findChild(QPushButton, "generate_heatmaps")
+
+        if heatmap_btn:
+            try:
+                heatmap_btn.clicked.connect(self.generate_heatmaps)
+                self.log_message(f"Connected 'Generate Heatmaps' button ({heatmap_btn.objectName()}).")
+            except Exception as e:
+                self.log_message(f"Warning: failed to connect heatmap button ({heatmap_btn.objectName()}): {e}")
+        else:
+            self.log_message("Warning: 'Generate Heatmaps' button not found in UI for connection.")
+        # Código de conexão antigo para 'export_all' removido. A nova conexão
+        # para 'export_all_results_btn' foi adicionada na seção de conexões.ise — keep the plugin usable.
+
         if hasattr(self.dialog, 'resetButton'):
             self.dialog.resetButton.clicked.connect(self.reset_plugin_state)
+
+    def on_orthogonalize_or_simplify_button_clicked(self):
+        """Open a helper dialog to simplify/orthogonalize gain/loss shapefiles in temp_dir.
+
+        - Defaults to `gain_filtered.shp` and `loss_filtered.shp` inside `self.temp_dir`.
+        - Preview loads a temporary layer into the project (tracked so it can be removed).
+        - Apply & Load writes output shapefile into `self.temp_dir` and adds it to the project.
+        - Next button enables and moves to the next tab (non-mandatory).
+        """
+        try:
+            from qgis import processing
+        except Exception:
+            processing = None
+
+        gain_path = os.path.join(self.temp_dir, "gain_filtered.shp")
+        loss_path = os.path.join(self.temp_dir, "loss_filtered.shp")
+
+        available = []
+        if os.path.exists(gain_path):
+            available.append(("Gain", gain_path))
+        if os.path.exists(loss_path):
+            available.append(("Loss", loss_path))
+
+        if not available:
+            QMessageBox.warning(self.dialog, "Not Found",
+                                "No filtered shapefiles found in temp directory:\n"
+                                f"{gain_path}\n{loss_path}\n\nRun vectorization first or check the temp folder.")
+            return
+
+        dlg = QDialog(self.dialog)
+        dlg.setWindowTitle("Simplify / Orthogonalize - Preview & Apply")
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel("Input Layer:"))
+        combo = QComboBox()
+        for label, path in available:
+            combo.addItem(label, path)
+        layout.addWidget(combo)
+
+        # Options
+        opts_layout = QHBoxLayout()
+        chk_simplify = QCheckBox("Simplify")
+        chk_simplify.setChecked(True)
+        opts_layout.addWidget(chk_simplify)
+        chk_orth = QCheckBox("Orthogonalize (if available)")
+        chk_orth.setChecked(False)
+        opts_layout.addWidget(chk_orth)
+        layout.addLayout(opts_layout)
+
+        tol_layout = QHBoxLayout()
+        tol_layout.addWidget(QLabel("Simplify tolerance (map units):"))
+        tol_spin = QDoubleSpinBox()
+        tol_spin.setRange(0.0, 1e6)
+        tol_spin.setDecimals(3)
+        tol_spin.setValue(1.0)
+        tol_layout.addWidget(tol_spin)
+        layout.addLayout(tol_layout)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        preview_btn = QPushButton("Preview")
+        apply_btn = QPushButton("Apply & Load")
+        next_btn = QPushButton("Next")
+        close_btn = QPushButton("Close")
+        btn_layout.addWidget(preview_btn)
+        btn_layout.addWidget(apply_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(next_btn)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        # Track preview layers so we can remove/replace them
+        if not hasattr(self, '_simplify_preview_layers'):
+            self._simplify_preview_layers = {}
+
+        def _remove_preview(label):
+            lid = self._simplify_preview_layers.get(label)
+            if lid:
+                try:
+                    QgsProject.instance().removeMapLayer(lid)
+                except Exception:
+                    pass
+                self._simplify_preview_layers.pop(label, None)
+
+        def run_processing_for(label, in_path, out_path):
+            # Sequence: simplify -> orthogonalize (if requested and available)
+            tmp_path = out_path
+            try:
+                current_in = in_path
+                # Simplify
+                if chk_simplify.isChecked():
+                    params = {
+                        'INPUT': current_in,
+                        'METHOD': 0,  # distance
+                        'TOLERANCE': float(tol_spin.value()),
+                        'OUTPUT': tmp_path
+                    }
+                    if processing:
+                        processing.run("native:simplifygeometries", params)
+                    else:
+                        raise RuntimeError(
+                            "Processing framework not available")
+                    current_in = tmp_path
+
+                # Orthogonalize (best-effort)
+                if chk_orth.isChecked():
+                    ort_path = os.path.splitext(tmp_path)[0] + "_ort.shp"
+                    try:
+                        if processing:
+                            processing.run("qgis:orthogonalize", {
+                                           'INPUT': current_in, 'OUTPUT': ort_path})
+                            current_in = ort_path
+                        else:
+                            raise RuntimeError(
+                                "Processing framework not available")
+                    except Exception:
+                        # If orthogonalize not available, warn and continue with current_in
+                        QMessageBox.warning(dlg, "Orthogonalize Unavailable",
+                                            "Orthogonalize algorithm not available on this QGIS installation.\n"
+                                            "Only simplification will be applied.")
+
+                return current_in
+            except Exception as e:
+                QMessageBox.warning(dlg, "Processing Error",
+                                    f"Error running processing: {e}")
+                return None
+
+        def do_preview():
+            label = combo.currentText()
+            in_path = combo.currentData()
+            out_tmp = os.path.join(
+                self.temp_dir, f"preview_{label.lower()}.shp")
+            # remove existing preview for label
+            _remove_preview(label)
+            result_path = run_processing_for(label, in_path, out_tmp)
+            if not result_path:
+                return
+            # load preview layer
+            v = QgsVectorLayer(result_path, f"{label} Preview", "ogr")
+            if not v.isValid():
+                QMessageBox.warning(dlg, "Preview Error",
+                                    "Failed to load preview layer.")
+                return
+            QgsProject.instance().addMapLayer(v)
+            self._simplify_preview_layers[label] = v.id()
+            QMessageBox.information(
+                dlg, "Preview Loaded", f"Preview layer loaded: {v.name()}\n\nIt will be removed when a new preview is created or the plugin is reset.")
+
+        def do_apply():
+            label = combo.currentText()
+            in_path = combo.currentData()
+            out_name = f"{label.lower()}_processed.shp"
+            out_path = os.path.join(self.temp_dir, out_name)
+            # Run processing and save output to out_path
+            res = run_processing_for(label, in_path, out_path)
+            if not res:
+                return
+            # If processing wrote to a different path (e.g., orthogonalize), copy/move to desired out_path
+            if res != out_path:
+                try:
+                    # overwrite if exists
+                    if os.path.exists(out_path):
+                        for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
+                            try:
+                                os.remove(os.path.splitext(out_path)[0] + ext)
+                            except Exception:
+                                pass
+                    # Copy all related shapefile files
+                    res_base_name = os.path.splitext(os.path.basename(res))[0]
+                    res_dir = os.path.dirname(res)
+                    for filename in os.listdir(res_dir):
+                        if filename.startswith(res_base_name):
+                            shutil.copy(os.path.join(res_dir, filename), os.path.join(
+                                os.path.dirname(out_path), filename.replace(res_base_name, os.path.splitext(os.path.basename(out_path))[0])))
+                except Exception as e:
+                    self.log_message(
+                        f"Error copying shapefile components: {e}")
+                    pass
+
+            # Remove previous preview for this label
+            _remove_preview(label)
+
+            # Load output into project and track it so plugin can remove later
+            layer = QgsVectorLayer(out_path, f"{label} Processed", "ogr")
+            if not layer.isValid():
+                QMessageBox.warning(
+                    dlg, "Load Error", "Failed to load processed layer into project.")
+                return
+            QgsProject.instance().addMapLayer(layer)
+            self.loaded_layer_ids.append(layer.id())
+
+            # Update the path for the next steps
+            if label == "Gain Vectors (with Metrics)":
+                self.filtered_gain_vector = out_path
+            elif label == "Loss Vectors (with Metrics)":
+                self.filtered_loss_vector = out_path
+
+            QMessageBox.information(
+                dlg, "Success", f"Processed layer added to project: {layer.name()}")
+
+        def do_next():
+            # enable next tab and advance one step (non-mandatory)
+            tw = getattr(self.dialog, 'tabWidget', None)
+            if tw:
+                cur = tw.currentIndex()
+                if cur + 1 < tw.count():
+                    tw.setTabEnabled(cur + 1, True)
+                    tw.setCurrentIndex(cur + 1)
+            dlg.accept()
+
+        preview_btn.clicked.connect(do_preview)
+        apply_btn.clicked.connect(do_apply)
+        next_btn.clicked.connect(do_next)
+        close_btn.clicked.connect(dlg.reject)
+
+        dlg.exec_()
 
     def log_message(self, message):
         if hasattr(self, 'log_text'):
@@ -1193,6 +2001,12 @@ class UrbanChangeAid:
             ax2.set_title('Histogram - Year 2')
             plt.tight_layout()
             canvas = FigureCanvas(fig)
+            # add navigation toolbar so user can pan/zoom the histogram
+            try:
+                toolbar = NavigationToolbar(canvas, dialog)
+                layout.addWidget(toolbar)
+            except Exception:
+                pass
             layout.addWidget(canvas)
 
             # Min Year 1 - Label, Slider e SpinBox
@@ -1204,16 +2018,16 @@ class UrbanChangeAid:
             min1_spinbox = QSpinBox()
             min1_spinbox.setRange(0, 255)
             min1_spinbox.setValue(min1_slider.value())
-            
+
             # Sincronização bidirecional
             min1_slider.valueChanged.connect(min1_spinbox.setValue)
             min1_spinbox.valueChanged.connect(min1_slider.setValue)
-            
+
             # Layout horizontal para slider e spinbox
             min1_layout = QHBoxLayout()
             min1_layout.addWidget(min1_slider)
             min1_layout.addWidget(min1_spinbox)
-            
+
             layout.addWidget(min1_label)
             layout.addLayout(min1_layout)
 
@@ -1226,16 +2040,16 @@ class UrbanChangeAid:
             max1_spinbox = QSpinBox()
             max1_spinbox.setRange(0, 255)
             max1_spinbox.setValue(max1_slider.value())
-            
+
             # Sincronização bidirecional
             max1_slider.valueChanged.connect(max1_spinbox.setValue)
             max1_spinbox.valueChanged.connect(max1_slider.setValue)
-            
+
             # Layout horizontal para slider e spinbox
             max1_layout = QHBoxLayout()
             max1_layout.addWidget(max1_slider)
             max1_layout.addWidget(max1_spinbox)
-            
+
             layout.addWidget(max1_label)
             layout.addLayout(max1_layout)
 
@@ -1248,16 +2062,16 @@ class UrbanChangeAid:
             min2_spinbox = QSpinBox()
             min2_spinbox.setRange(0, 255)
             min2_spinbox.setValue(min2_slider.value())
-            
+
             # Sincronização bidirecional
             min2_slider.valueChanged.connect(min2_spinbox.setValue)
             min2_spinbox.valueChanged.connect(min2_slider.setValue)
-            
+
             # Layout horizontal para slider e spinbox
             min2_layout = QHBoxLayout()
             min2_layout.addWidget(min2_slider)
             min2_layout.addWidget(min2_spinbox)
-            
+
             layout.addWidget(min2_label)
             layout.addLayout(min2_layout)
 
@@ -1270,22 +2084,28 @@ class UrbanChangeAid:
             max2_spinbox = QSpinBox()
             max2_spinbox.setRange(0, 255)
             max2_spinbox.setValue(max2_slider.value())
-            
+
             # Sincronização bidirecional
             max2_slider.valueChanged.connect(max2_spinbox.setValue)
             max2_spinbox.valueChanged.connect(max2_slider.setValue)
-            
+
             # Layout horizontal para slider e spinbox
             max2_layout = QHBoxLayout()
             max2_layout.addWidget(max2_slider)
             max2_layout.addWidget(max2_spinbox)
-            
+
             layout.addWidget(max2_label)
             layout.addLayout(max2_layout)
 
             fig_prev, (ax_prev1, ax_prev2) = plt.subplots(
                 1, 2, figsize=(12, 5))
             canvas_prev = FigureCanvas(fig_prev)
+            # add toolbar for preview so zoom works
+            try:
+                toolbar_prev = NavigationToolbar(canvas_prev, dialog)
+                layout.addWidget(toolbar_prev)
+            except Exception:
+                pass
             layout.addWidget(QLabel("Normalization Preview:"))
             layout.addWidget(canvas_prev)
 
@@ -1581,7 +2401,8 @@ class UrbanChangeAid:
 
             # Try OTB MAD; fallback to simple raster diff if OTB not available
             try:
-                self.log_message("Tentando OTB MultivariateAlterationDetector")
+                self.log_message(
+                    "Attempting OTB MultivariateAlterationDetector")
                 processing.run("otb:MultivariateAlterationDetector", {
                     'in1': year1_path,
                     'in2': year2_path,
@@ -1590,17 +2411,17 @@ class UrbanChangeAid:
                 })
             except Exception as e_otb:
                 self.log_message(
-                    f"OTB falhou: {str(e_otb)}. Revertendo para diferença simples.")
+                    f"OTB failed: {str(e_otb)}. Falling back to simple difference.")
                 ds1 = gdal.Open(year1_path)
                 ds2 = gdal.Open(year2_path)
                 if ds1 is None or ds2 is None:
                     self.log_message(
-                        f"Falha ao abrir imagens: Year1={year1_path}, Year2={year2_path}")
+                        f"Failed to open images: Year1={year1_path}, Year2={year2_path}")
                     return
                 arr1 = ds1.GetRasterBand(1).ReadAsArray().astype(np.float32)
                 arr2 = ds2.GetRasterBand(1).ReadAsArray().astype(np.float32)
                 if arr1.shape != arr2.shape:
-                    self.log_message("Imagens com dimensões diferentes.")
+                    self.log_message("Images have different dimensions.")
                     return
                 ds1 = None
                 ds2 = None
@@ -1610,27 +2431,100 @@ class UrbanChangeAid:
                     self.difference_path, diff_arr.shape[1], diff_arr.shape[0], 1, gdal.GDT_Float32)
                 if out is None:
                     self.log_message(
-                        f"Falha ao criar output: {self.difference_path}")
+                        f"Failed to create output: {self.difference_path}")
                     return
                 out.SetGeoTransform(gdal.Open(year1_path).GetGeoTransform())
                 out.SetProjection(gdal.Open(year1_path).GetProjection())
                 out.GetRasterBand(1).WriteArray(diff_arr)
                 out = None
-                self.log_message("Fallback GDAL completado.")
+                self.log_message("Fallback GDAL completed.")
 
             if os.path.exists(self.difference_path) and QgsRasterLayer(self.difference_path, "").isValid():
                 self._load_to_project(self.difference_path, "Difference Image")
                 self.log_message("Successfully calculated difference.")
                 QMessageBox.information(
-                    self.dialog, "Sucess", "Successfully calculated difference.")
+                    self.dialog, "Success", "Successfully calculated difference.")
             else:
                 raise Exception("Failed to create difference image.")
 
         except Exception as e:
-            self.log_message(f"Erro no cálculo da diferença: {str(e)}")
-            QMessageBox.warning(self.dialog, "Erro",
-                                f"Erro ao calcular a diferença: {str(e)}")
+            self.log_message(f"Error calculating difference: {str(e)}")
+            QMessageBox.warning(self.dialog, "Error",
+                                f"Error calculating difference: {str(e)}")
             return
+
+    def _apply_pseudo_color_renderer(self, layer, min_val=None, max_val=None):
+        """Apply a three-color pseudo color renderer: losses (blue) at min, neutral (white) at 0, gains (red) at max.
+
+        This preserves the original Float32 difference values in the raster and maps them for visualization.
+        If min_val/max_val are not provided, attempt to read them from the raster on disk.
+        """
+        try:
+            if layer is None or not isinstance(layer, QgsRasterLayer):
+                self.log_message(
+                    "_apply_pseudo_color_renderer: invalid layer provided.")
+                return
+
+            # If min/max not provided, read from raster
+            if min_val is None or max_val is None:
+                try:
+                    src = layer.source() if hasattr(
+                        layer, 'source') else layer.dataProvider().dataSourceUri()
+                    ds = gdal.Open(src)
+                    if ds is not None:
+                        arr = ds.GetRasterBand(
+                            1).ReadAsArray().astype(np.float32)
+                        ds = None
+                        min_val = float(
+                            np.nanmin(arr)) if min_val is None else min_val
+                        max_val = float(
+                            np.nanmax(arr)) if max_val is None else max_val
+                except Exception:
+                    # leave min_val/max_val as-is (may still be None)
+                    pass
+
+            # Ensure numeric min/max
+            if min_val is None or max_val is None or np.isnan(min_val) or np.isnan(max_val):
+                self.log_message(
+                    "_apply_pseudo_color_renderer: invalid min/max, aborting renderer application.")
+                return
+
+            # Avoid zero-range ramps
+            if np.isclose(min_val, max_val):
+                min_val = float(min_val) - 1.0
+                max_val = float(max_val) + 1.0
+
+            entries = []
+            try:
+                entries.append(QgsColorRampShader.ColorRampItem(
+                    min_val, QColor(0, 0, 255), f"{min_val:.6f}"))
+                # include neutral white at 0 if within range
+                if min_val < 0.0 < max_val:
+                    entries.append(QgsColorRampShader.ColorRampItem(
+                        0.0, QColor(255, 255, 255), '0'))
+                entries.append(QgsColorRampShader.ColorRampItem(
+                    max_val, QColor(255, 0, 0), f"{max_val:.6f}"))
+            except Exception:
+                # Fallback: use normalized positions if something goes wrong
+                entries = [QgsColorRampShader.ColorRampItem(0.0, QColor(0, 0, 255), 'min'),
+                           QgsColorRampShader.ColorRampItem(
+                               0.5, QColor(255, 255, 255), '0'),
+                           QgsColorRampShader.ColorRampItem(1.0, QColor(255, 0, 0), 'max')]
+
+            color_ramp = QgsColorRampShader()
+            color_ramp.setColorRampItemList(entries)
+            color_ramp.setColorRampType(QgsColorRampShader.Interpolated)
+
+            raster_shader = QgsRasterShader()
+            raster_shader.setRasterShaderFunction(color_ramp)
+
+            renderer = QgsSingleBandPseudoColorRenderer(
+                layer.dataProvider(), 1, raster_shader)
+            layer.setRenderer(renderer)
+            layer.triggerRepaint()
+            self.log_message("Pseudo-color renderer applied (min/max).")
+        except Exception as e:
+            self.log_message(f"Error applying pseudo-color renderer: {e}")
 
     def next_to_gain_loss(self):
         if self.difference_path and os.path.exists(self.difference_path):
@@ -1640,7 +2534,7 @@ class UrbanChangeAid:
             self.log_message("Navegado para a aba Gain & Loss Masks.")
         else:
             QMessageBox.warning(
-                self.dialog, "Aviso", "Por favor, calcule a imagem de diferença primeiro.")
+                self.dialog, "Warning", "Please compute the difference image first.")
 
     def show_gain_loss_dialog(self):
         has_bins = (
@@ -1682,7 +2576,8 @@ class UrbanChangeAid:
         sieve_threshold_spin = QSpinBox()
         sieve_threshold_spin.setRange(1, 1000)
         sieve_threshold_spin.setValue(8)
-        sieve_threshold_spin.setToolTip("Minimum number of connected pixels to keep. Smaller groups will be removed.")
+        sieve_threshold_spin.setToolTip(
+            "Minimum number of connected pixels to keep. Smaller groups will be removed.")
         layout.addWidget(QLabel("Sieve Threshold (pixels):"))
         layout.addWidget(sieve_threshold_spin)
 
@@ -1700,7 +2595,8 @@ class UrbanChangeAid:
 
         # Button to apply sieve to already generated masks
         apply_sieve_button = QPushButton("Clean Isolated Pixels (Apply Sieve)")
-        apply_sieve_button.setToolTip("Remove small isolated pixel groups from the generated masks")
+        apply_sieve_button.setToolTip(
+            "Remove small isolated pixel groups from the generated masks")
 
         def apply_sieve_and_close():
             self.apply_sieve_to_masks(
@@ -1734,10 +2630,10 @@ class UrbanChangeAid:
             ds = None
 
             # Generate masks
-            gain = np.where(diff > thresh_gain, 0, 255).astype(
-                np.uint8)   # black = gain
-            loss = np.where(diff < thresh_loss, 255, 0).astype(
-                np.uint8)   # white = loss
+            # Gain: pixels with values GREATER THAN OR EQUAL TO the gain threshold are considered gain (255 = white)
+            gain = np.where(diff >= thresh_gain, 255, 0).astype(np.uint8)
+            # Loss: pixels with values LESS THAN OR EQUAL TO the loss threshold are considered loss (255 = white)
+            loss = np.where(diff <= thresh_loss, 255, 0).astype(np.uint8)
 
             driver = gdal.GetDriverByName('GTiff')
             out_g = driver.Create(
@@ -1832,12 +2728,44 @@ class UrbanChangeAid:
             self.dialog.tabWidget.setTabEnabled(7, True)
             self.dialog.tabWidget.setCurrentIndex(7)
         else:
-            QMessageBox.warning(self.dialog, "Aviso",
-                                "Gere as máscaras de ganho/perda primeiro.")
+            QMessageBox.warning(self.dialog, "Warning",
+                                "Please generate gain/loss masks first.")
 
     def on_generate_gain_loss_clicked(self):
         """Slot connected to the button in the UI. Opens the Gain/Loss settings dialog."""
         self.show_gain_loss_dialog()
+
+        def _remove_background_features(self, vector_path, field_name, value_to_remove):
+            """Remove feições de um shapefile onde o campo especificado tem o valor especificado."""
+            try:
+                layer = QgsVectorLayer(vector_path, os.path.basename(vector_path), "ogr")
+                if not layer.isValid():
+                    self.log_message(f"Falha ao carregar layer para remoção de background: {vector_path}")
+                    return
+
+                if not layer.startEditing():
+                    self.log_message(f"Falha ao iniciar edição para remoção de background: {vector_path}")
+                    return
+
+                ids_to_delete = []
+                for feature in layer.getFeatures():
+                    if feature[field_name] == value_to_remove:
+                        ids_to_delete.append(feature.id())
+
+                if ids_to_delete:
+                    layer.deleteFeatures(ids_to_delete)
+                    layer.commitChanges()
+                    self.log_message(f"Removidas {len(ids_to_delete)} feições de background (valor {value_to_remove} no campo '{field_name}') de {os.path.basename(vector_path)}")
+                else:
+                    layer.rollBack()
+                self.log_message(f"Nenhuma feição de background encontrada para remoção em {os.path.basename(vector_path)}")
+
+            except Exception as e:
+                self.log_message(f"Erro ao remover feições de background em {vector_path}: {str(e)}")
+                try:
+                    layer.rollBack()
+                except Exception:
+                    pass
 
     def vectorize_and_orthogonalize(self):
         """Vetoriza as máscaras de ganho/perda (usa as sieved se existirem)."""
@@ -1853,8 +2781,8 @@ class UrbanChangeAid:
         )
 
         if not (gain_input or loss_input):
-            QMessageBox.warning(self.dialog, "Aviso",
-                                "Gere as máscaras de ganho/perda primeiro.")
+            QMessageBox.warning(self.dialog, "Warning",
+                                "Please generate gain/loss masks first.")
             return
 
         try:
@@ -1869,7 +2797,8 @@ class UrbanChangeAid:
                     "BAND": 1,
                     "FIELD": "val",
                     "OUTPUT": self.gain_vector_path
-                })
+                }, is_child_algorithm=True)
+                self._remove_background_features(self.gain_vector_path, "val", 0)
                 self._load_vector_to_project(
                     self.gain_vector_path, "Gain Vector")
 
@@ -1881,8 +2810,9 @@ class UrbanChangeAid:
                     "BAND": 1,
                     "FIELD": "val",
                     "OUTPUT": self.loss_vector_path
-                })
-            self._load_vector_to_project(self.loss_vector_path, "Loss Vector")
+                }, is_child_algorithm=True)
+                self._remove_background_features(self.loss_vector_path, "val", 0)
+                self._load_vector_to_project(self.loss_vector_path, "Loss Vector")
 
             QMessageBox.information(
                 self.dialog, "Success", "Masks vectorized successfully.")
@@ -1917,295 +2847,12 @@ class UrbanChangeAid:
         self.log_message(f"Vector layer loaded: {name}")
         return layer
 
-    def open_vectors_preview(self):
-        if not self.gain_mask_path or not self.loss_mask_path or not os.path.exists(self.gain_mask_path) or not os.path.exists(self.loss_mask_path):
-            QMessageBox.warning(self.dialog, "Warning",
-                                "Generate the gain and loss masks first.")
-            return
-
-        ds_gain = gdal.Open(self.gain_mask_path)
-        ds_loss = gdal.Open(self.loss_mask_path)
-        arr_gain = ds_gain.ReadAsArray()
-        arr_loss = ds_loss.ReadAsArray()
-        preview_gain = arr_gain[::4,
-                                ::4] if arr_gain.shape[0] > 800 else arr_gain
-        preview_loss = arr_loss[::4,
-                                ::4] if arr_loss.shape[0] > 800 else arr_loss
-        ds_gain = None
-        ds_loss = None
-        arr_bin_gain = (preview_gain == 255).astype(np.uint8)
-        arr_bin_loss = (preview_loss == 255).astype(np.uint8)
-
-        preview_dialog = QDialog(self.dialog)
-        preview_dialog.setWindowTitle(
-            "Vectorization and Metrics Filter Preview")
-        preview_dialog.resize(1200, 800)
-        layout = QVBoxLayout()
-
-        min_area_slider = QSlider(Qt.Horizontal)
-        min_area_slider.setRange(1, 1000)
-        min_area_slider.setValue(50)
-        min_area_label = QLabel(f"{min_area_slider.value()} px")
-        min_area_slider.valueChanged.connect(
-            lambda val: min_area_label.setText(f"{val} px"))
-        layout.addWidget(QLabel("Minimum polygon area:"))
-        layout.addWidget(min_area_slider)
-        layout.addWidget(min_area_label)
-
-        min_compact_slider = QSlider(Qt.Horizontal)
-        min_compact_slider.setRange(1, 100)
-        min_compact_slider.setValue(30)
-        min_compact_label = QLabel(f"{min_compact_slider.value()/100:.2f}")
-        min_compact_slider.valueChanged.connect(
-            lambda val: min_compact_label.setText(f"{val/100:.2f}"))
-        layout.addWidget(QLabel("Minimum compactness (buildings):"))
-        layout.addWidget(min_compact_slider)
-        layout.addWidget(min_compact_label)
-
-        simplify_tolerance_slider = QSlider(Qt.Horizontal)
-        simplify_tolerance_slider.setRange(0, 10)
-        simplify_tolerance_slider.setValue(2)
-        simplify_label = QLabel(
-            f"Simplification Tolerance: {simplify_tolerance_slider.value()}")
-        simplify_tolerance_slider.valueChanged.connect(
-            lambda val: simplify_label.setText(f"Simplification Tolerance: {val}"))
-        layout.addWidget(QLabel("Tolerance for Simplification:"))
-        layout.addWidget(QLabel(
-            "Higher value: more simplification (less details); Lower value: less simplification (more details)"))
-        layout.addWidget(simplify_tolerance_slider)
-        layout.addWidget(simplify_label)
-
-        ortho_tolerance_slider = QSlider(Qt.Horizontal)
-        ortho_tolerance_slider.setRange(0, 5)
-        ortho_tolerance_slider.setValue(1)
-        ortho_label = QLabel(
-            f"Orthogonalization Tolerance: {ortho_tolerance_slider.value()/2:.1f}")
-        ortho_tolerance_slider.valueChanged.connect(
-            lambda val: ortho_label.setText(f"Orthogonalization Tolerance: {val/2:.1f}"))
-        layout.addWidget(QLabel("Tolerance for Orthogonalization:"))
-        layout.addWidget(QLabel(
-            "Higher value: allows more angular deviation; Lower value: forces stricter orthogonality"))
-        layout.addWidget(ortho_tolerance_slider)
-        layout.addWidget(ortho_label)
-
-        fig_gain, ax_gain = plt.subplots(figsize=(7, 5))
-        canvas_gain = FigureCanvas(fig_gain)
-        layout.addWidget(
-            QLabel("Vectorization Preview Gain (Year 2 - Year 1):"))
-        layout.addWidget(canvas_gain)
-
-        fig_loss, ax_loss = plt.subplots(figsize=(7, 5))
-        canvas_loss = FigureCanvas(fig_loss)
-        layout.addWidget(
-            QLabel("Vectorization Preview Loss (Year 1 - Year 2):"))
-        layout.addWidget(canvas_loss)
-
-        def update_preview():
-            labeled_gain, num_gain = ndi.label(arr_bin_gain)
-            filtered_gain = np.zeros_like(arr_bin_gain)
-            for i in range(1, num_gain + 1):
-                component = (labeled_gain == i)
-                coords = np.argwhere(component)
-                area = coords.shape[0]
-                if area < min_area_slider.value():
-                    continue
-                min_y, min_x = coords.min(0)
-                max_y, max_x = coords.max(0)
-                width = max_x - min_x + 1
-                height = max_y - min_y + 1
-                perimeter = 2 * (width + height)
-                compacidade = 4 * np.pi * area / \
-                    (perimeter ** 2) if perimeter > 0 else 0
-                if compacidade < min_compact_slider.value() / 100:
-                    continue
-                filtered_gain[component] = 1
-            ax_gain.clear()
-            ax_gain.imshow(filtered_gain, cmap='gray')
-            ax_gain.set_title('Preview Gain Mask', fontsize=10)
-            canvas_gain.draw()
-
-            labeled_loss, num_loss = ndi.label(arr_bin_loss)
-            filtered_loss = np.zeros_like(arr_bin_loss)
-            for i in range(1, num_loss + 1):
-                component = (labeled_loss == i)
-                coords = np.argwhere(component)
-                area = coords.shape[0]
-                if area < min_area_slider.value():
-                    continue
-                min_y, min_x = coords.min(0)
-                max_y, max_x = coords.max(0)
-                width = max_x - min_x + 1
-                height = max_y - min_y + 1
-                perimeter = 2 * (width + height)
-                compacidade = 4 * np.pi * area / \
-                    (perimeter ** 2) if perimeter > 0 else 0
-                if compacidade < min_compact_slider.value() / 100:
-                    continue
-                filtered_loss[component] = 1
-            ax_loss.clear()
-            ax_loss.imshow(filtered_loss, cmap='gray')
-            ax_loss.set_title('Preview Loss Mask', fontsize=10)
-            canvas_loss.draw()
-
-        min_area_slider.valueChanged.connect(update_preview)
-        min_compact_slider.valueChanged.connect(update_preview)
-        simplify_tolerance_slider.valueChanged.connect
-        ortho_tolerance_slider.valueChanged.connect(update_preview)
-
-        def apply_vectorization():
-            simplify_tol = simplify_tolerance_slider.value()
-            ortho_tol = ortho_tolerance_slider.value() / 2.0
-            min_area = min_area_slider.value()
-            min_compact = min_compact_slider.value() / 100
-
-            ds_gain_full = gdal.Open(self.gain_mask_path)
-            ds_loss_full = gdal.Open(self.loss_mask_path)
-            arr_gain_full = ds_gain_full.ReadAsArray()
-            arr_loss_full = ds_loss_full.ReadAsArray()
-            arr_bin_gain_full = (arr_gain_full == 255).astype(np.uint8)
-            arr_bin_loss_full = (arr_loss_full == 255).astype(np.uint8)
-
-            out_gain_path = os.path.join(
-                self.temp_dir, "vector_preview_gain.tif")
-            driver = gdal.GetDriverByName('GTiff')
-            out_ds_gain = driver.Create(
-                out_gain_path, ds_gain_full.RasterXSize, ds_gain_full.RasterYSize, 1, gdal.GDT_Byte)
-            out_ds_gain.SetGeoTransform(ds_gain_full.GetGeoTransform())
-            out_ds_gain.SetProjection(ds_gain_full.GetProjection())
-            labeled_gain, num_gain = ndi.label(arr_bin_gain_full)
-            filtered_gain = np.zeros_like(arr_bin_gain_full)
-            for i in range(1, num_gain + 1):
-                component = (labeled_gain == i)
-                coords = np.argwhere(component)
-                area = coords.shape[0]
-                if area < min_area:
-                    continue
-
-                min_y, min_x = coords.min(0)
-                max_y, max_x = coords.max(0)
-                width = max_x - min_x + 1
-                height = max_y - min_y + 1
-                perimeter = 2 * (width + height)
-                compacidade = 4 * np.pi * area / \
-                    (perimeter ** 2) if perimeter > 0 else 0
-                if compacidade < min_compact:
-                    continue
-                filtered_gain[component] = 1
-            out_ds_gain.GetRasterBand(1).WriteArray(filtered_gain * 255)
-            out_ds_gain = None
-
-            out_loss_path = os.path.join(
-                self.temp_dir, "vector_preview_loss.tif")
-            out_ds_loss = driver.Create(
-                out_loss_path, ds_loss_full.RasterXSize, ds_loss_full.RasterYSize, 1, gdal.GDT_Byte)
-            out_ds_loss.SetGeoTransform(ds_loss_full.GetGeoTransform())
-            out_ds_loss.SetProjection(ds_loss_full.GetProjection())
-            labeled_loss, num_loss = ndi.label(arr_bin_loss_full)
-            filtered_loss = np.zeros_like(arr_bin_loss_full)
-            for i in range(1, num_loss + 1):
-                component = (labeled_loss == i)
-                coords = np.argwhere(component)
-                area = coords.shape[0]
-                if area < min_area:
-                    continue
-                min_y, min_x = coords.min(0)
-                max_y, max_x = coords.max(0)
-                width = max_x - min_x + 1
-                height = max_y - min_y + 1
-                perimeter = 2 * (width + height)
-                compacidade = 4 * np.pi * area / \
-                    (perimeter ** 2) if perimeter > 0 else 0
-                if compacidade < min_compact:
-                    continue
-                filtered_loss[component] = 1
-            out_ds_loss.GetRasterBand(1).WriteArray(filtered_loss * 255)
-            out_ds_loss = None
-
-            ds_gain_full = None
-            ds_loss_full = None
-
-            self.gain_vector_path = os.path.join(
-                self.temp_dir, "preview_gain_vector_raw.shp")
-            processing.run("gdal:polygonize", {
-                "INPUT": out_gain_path,
-                "BAND": 1,
-                "FIELD": "val",
-                "OUTPUT": self.gain_vector_path
-            })
-
-            # Definir caminhos finais para os vetores ortogonalizados
-            self.ortho_gain_path = os.path.join(
-                self.temp_dir, "preview_gain_vector_ortho.shp")
-            self.ortho_loss_path = os.path.join(
-                self.temp_dir, "preview_loss_vector_ortho.shp")
-
-            # Ortho para GAIN
-            self._orthogonalize_vector(
-                self.gain_vector_path, self.ortho_gain_path, simplify_tol, ortho_tol
-            )
-            self._load_vector_to_project(
-                self.ortho_gain_path, "Preview Gain Vector (Ortho)"
-            )
-
-            # Criar RAW para LOSS
-            loss_vector_raw = os.path.join(
-                self.temp_dir, "preview_loss_vector_raw.shp")
-            processing.run("gdal:polygonize", {
-                "INPUT": out_loss_path,
-                "BAND": 1,
-                "FIELD": "val",
-                "OUTPUT": loss_vector_raw
-            })
-
-            # Ortho para LOSS
-            self._orthogonalize_vector(
-                loss_vector_raw, self.ortho_loss_path, simplify_tol, ortho_tol
-            )
-            self._load_vector_to_project(
-                self.ortho_loss_path, "Preview Loss Vector (Ortho)"
-            )
-
-            QMessageBox.information(
-                self.dialog, "Success", "Vectorization with filters and orthogonalization applied and loaded in the project."
-            )
-            preview_dialog.accept()
-
-        apply_button = QPushButton("Apply Vectorization and Orthogonalization")
-        apply_button.clicked.connect(apply_vectorization)
-        layout.addWidget(apply_button)
-
-        preview_dialog.setLayout(layout)
-        update_preview()
-        preview_dialog.exec_()
-
-    def _orthogonalize_vector(self, input_path, output_path, simplify_tol, ortho_tol):
-        layer = QgsVectorLayer(input_path, "temp", "ogr")
-        fields = layer.fields()
-        writer = QgsVectorFileWriter(
-            output_path, 'UTF-8', fields, QgsWkbTypes.Polygon, layer.crs(), 'ESRI Shapefile')
-        for feat in layer.getFeatures():
-            geom = feat.geometry()
-            if not geom or geom.isEmpty():
-                continue
-            simplified = geom.simplify(simplify_tol)
-            orthogonal = simplified.densifyByCount(5).orthogonalize(
-                ortho_tol) if hasattr(simplified, 'orthogonalize') else simplified
-            feat.setGeometry(orthogonal)
-            writer.addFeature(feat)
-        del writer
-
-        self._load_vector_to_project(self.gain_vector_path, "Gain Vectors")
-        self._load_vector_to_project(self.loss_vector_path, "Loss Vectors")
-
-        # agora sim os combos podem ser atualizados
-        # self.populate_vector_combos()
-
     def reproject_gain_loss_to_utm(self):
         """Reprojeta os vetores de ganho/perda para UTM e salva shapefiles."""
         try:
             if not self.gain_vector_path or not self.loss_vector_path:
                 QMessageBox.warning(
-                    self.dialog, "Aviso", "Vectorize primeiro as máscaras de ganho/perda.")
+                    self.dialog, "Warning", "Please vectorize the gain/loss masks first.")
                 return
 
             output_dir = os.path.join(self.temp_dir, "vectors_utm")
@@ -2237,17 +2884,17 @@ class UrbanChangeAid:
                 self.loss_vector_utm_path, "Loss Vector UTM")
 
             QMessageBox.information(
-                self.dialog, "Sucesso", "Vetores reprojetados para UTM e carregados no projeto.")
+                self.dialog, "Success", "Vectors reprojected to UTM and loaded into the project.")
 
         except Exception as e:
-            QMessageBox.warning(self.dialog, "Erro",
-                                f"Erro ao reprojetar vetores: {str(e)}")
+            QMessageBox.warning(self.dialog, "Error",
+                                f"Error reprojecting vectors: {str(e)}")
 
     def next_to_metrics(self):
         """Abre a aba Metrics carregando diretamente os vetores UTM exportados."""
         if not hasattr(self, 'gain_vector_utm_path') or not os.path.exists(self.gain_vector_utm_path):
             QMessageBox.warning(
-                self.dialog, "Aviso", "Reprojete os vetores primeiro na aba Vectorize.")
+                self.dialog, "Warning", "Please reproject the vectors first in the Vectorize tab.")
             return
 
         # Remove camadas duplicadas usando IDs para evitar invalidação
@@ -2261,10 +2908,14 @@ class UrbanChangeAid:
                     self.log_message(
                         f"Removed duplicate layer with ID {layer_id} from QGIS project for {name} (files on disk are not deleted)")
 
-        # Habilita aba Metrics
-        tab_index = 8  # índice da aba Metrics (ajuste conforme sua UI)
-        self.dialog.tabWidget.setTabEnabled(tab_index, True)
-        self.dialog.tabWidget.setCurrentIndex(tab_index)
+        # Habilita a aba Metrics (avança uma aba a partir da posição atual)
+        tw = getattr(self.dialog, 'tabWidget', None)
+        if tw:
+            cur = tw.currentIndex()
+            next_index = cur + 1
+            if next_index < tw.count():
+                tw.setTabEnabled(next_index, True)
+                tw.setCurrentIndex(next_index)
 
         # Carrega vetores UTM para edição
         self.gain_layer = QgsVectorLayer(
@@ -2282,8 +2933,8 @@ class UrbanChangeAid:
 
         for layer in [self.gain_layer, self.loss_layer]:
             if not layer.isValid():
-                QMessageBox.warning(self.dialog, "Erro",
-                                    f"Falha ao carregar camada {layer.name()}")
+                QMessageBox.warning(self.dialog, "Error",
+                                    f"Failed to load layer {layer.name()}")
                 return
 
             if not layer.isEditable():
@@ -2355,7 +3006,7 @@ class UrbanChangeAid:
         """
         if not hasattr(self, 'gain_vector_utm_path') or not os.path.exists(self.gain_vector_utm_path):
             QMessageBox.warning(
-                self.dialog, "Aviso", "Reprojete os vetores primeiro na aba Vectorize.")
+                self.dialog, "Warning", "Please reproject the vectors first in the Vectorize tab.")
             return
 
         self.gain_layer = self.ensure_fields(
@@ -2363,7 +3014,7 @@ class UrbanChangeAid:
         if self.gain_layer:
             QgsProject.instance().addMapLayer(self.gain_layer)
             self.log_message(
-                "Gain Vector UTM carregado via load_gain_vector (compatibilidade).")
+                "Gain Vector UTM loaded via load_gain_vector (compatibility).")
 
     def load_loss_vector(self):
         """
@@ -2380,7 +3031,31 @@ class UrbanChangeAid:
         if self.loss_layer:
             QgsProject.instance().addMapLayer(self.loss_layer)
             self.log_message(
-                "Loss Vector UTM carregado via load_loss_vector (compatibilidade).")
+                "Loss Vector UTM loaded via load_loss_vector (compatibility).")
+
+    def next_to_export(self):
+        """Avança para a aba Export & Finish (compatibilidade com botões UI antigos).
+
+        Este método foi adicionado explicitamente dentro da classe para garantir
+        que `self.next_to_export` exista quando sinais tentarem conectar-se a ele.
+        """
+        try:
+            current_index = self.dialog.tabWidget.currentIndex()
+            next_index = current_index + 1
+            # Habilita o próximo tab e avança
+            self.dialog.tabWidget.setTabEnabled(next_index, True)
+            self.dialog.tabWidget.setCurrentIndex(next_index)
+            self.log_message(
+                f"➡️ Advanced from tab {current_index} to {next_index} (Export & Finish). Buttons now enabled.")
+        except Exception as e:
+            self.log_message(
+                f"Error advancing to Export & Finish tab: {str(e)}")
+            try:
+                QMessageBox.warning(self.dialog, "Error",
+                                    f"Error advancing: {str(e)}")
+            except Exception:
+                # In case dialog is not available, just log
+                pass
 
     def calculate_and_display_metrics(self):
         try:
@@ -2620,6 +3295,38 @@ class UrbanChangeAid:
 
         return layer
 
+    def _remove_background_features(self, vector_path, field_name, value_to_remove):
+        """Remove feições de um shapefile onde o campo especificado tem o valor especificado."""
+        try:
+            layer = QgsVectorLayer(vector_path, os.path.basename(vector_path), "ogr")
+            if not layer.isValid():
+                self.log_message(f"Falha ao carregar layer para remoção de background: {vector_path}")
+                return
+
+            if not layer.startEditing():
+                self.log_message(f"Falha ao iniciar edição para remoção de background: {vector_path}")
+                return
+
+            ids_to_delete = []
+            for feature in layer.getFeatures():
+                if feature[field_name] == value_to_remove:
+                    ids_to_delete.append(feature.id())
+
+            if ids_to_delete:
+                layer.deleteFeatures(ids_to_delete)
+                layer.commitChanges()
+                self.log_message(f"Removidas {len(ids_to_delete)} feições de background (valor {value_to_remove} no campo '{field_name}') de {os.path.basename(vector_path)}")
+            else:
+                layer.rollBack()
+                self.log_message(f"Nenhuma feição de background encontrada para remoção em {os.path.basename(vector_path)}")
+
+        except Exception as e:
+            self.log_message(f"Erro ao remover feições de background em {vector_path}: {str(e)}")
+            try:
+                layer.rollBack()
+            except Exception:
+                pass
+
     def filter_vectors_by_metrics(self):
         try:
             # Prioriza SpinBox para precisão; fallback para slider se não existir
@@ -2678,7 +3385,7 @@ class UrbanChangeAid:
             # Para Loss (repete o padrão)
             if loss_layers and len(loss_layers) > 0:
                 loss_layer = loss_layers[0]
-                expression = expression_base + ' AND "val" = 0'
+                expression = expression_base + ' AND "val" = 255'
                 loss_layer.removeSelection()
                 loss_layer.selectByExpression(expression)
                 self.log_message(
@@ -2688,7 +3395,7 @@ class UrbanChangeAid:
                 if after_select == 0:
                     # Fallback: selecione só válidas
                     loss_layer.selectByExpression(
-                        '"is_valid" = 1 AND "val" = 0')
+                        '"is_valid" = 1 AND "val" = 255')
                     self.log_message("Fallback: All valid selected")
                 self.iface.layerTreeView().refreshLayerSymbology(loss_layer.id())
 
@@ -2752,7 +3459,14 @@ class UrbanChangeAid:
         self.log_message("📦 Creating main dialog...")
 
         # === Cria janela principal
-        dlg = QDialog(self.dialog)
+        # CORREÇÃO 2: Armazenar o diálogo como atributo para evitar que seja destruído prematuramente
+        if hasattr(self, '_preview_dialog') and self._preview_dialog is not None:
+            try:
+                self._preview_dialog.close()
+            except:
+                pass
+        self._preview_dialog = QDialog(self.dialog)
+        dlg = self._preview_dialog
         dlg.setWindowTitle("Metrics Filter Preview")
         dlg.resize(1000, 900)
         main_layout = QVBoxLayout(dlg)
@@ -2805,10 +3519,9 @@ class UrbanChangeAid:
             box.addWidget(sld)
             box.addWidget(spn)
 
-            # Sincronização bidirecional
-            sld.valueChanged.connect(lambda val: spn.setValue(val / scale))
-            spn.valueChanged.connect(
-                lambda val: sld.setValue(int(val * scale)))
+            # NOTE: avoid automatic bidirectional connections here to prevent
+            # recursive signal loops. Connections will be created explicitly
+            # after the controls are returned, with proper signal blocking.
 
             return box, sld, spn
 
@@ -2825,23 +3538,100 @@ class UrbanChangeAid:
             gain_layout.addLayout(box)
 
         # ---- Sincroniza sliders/spins ----
-        slider_area_g.valueChanged.connect(lambda v: spin_area_g.setValue(v))
-        spin_area_g.valueChanged.connect(
-            lambda v: slider_area_g.setValue(int(v)))
+        # CORREÇÃO: Usar a precisão do QDoubleSpinBox para o slider de área
+        # O slider deve ser um QDoubleSpinBox ou usar um fator de escala para o QSlider
+        # Como o slider é um QSlider (int), vamos usar um fator de escala (100)
+        # para simular a precisão de duas casas decimais no spin box.
+        # O QSlider deve ser reconfigurado para ter um range maior.
+        # No entanto, a função metric_slider já cria o QSlider.
+        # Vamos assumir que o QSlider é um QSlider (int) e o spin é QDoubleSpinBox.
+        # A conversão de volta para int no spin_area_g.valueChanged é o problema.
+        # A solução é usar o QDoubleSpinBox como a fonte de verdade e o QSlider como um visualizador/ajustador grosseiro.
+        # Ou, melhor, reconfigurar o QSlider para usar um fator de escala.
+        
+        # Vamos reconfigurar o QSlider para usar um fator de escala de 100 (2 casas decimais)
+        slider_area_g.setRange(0, 20000) # 0.00 a 200.00
+        slider_area_g.setValue(int(spin_area_g.value() * 100))
+        
+        def update_spin_area_g(val):
+            try:
+                spin_area_g.blockSignals(True)
+                spin_area_g.setValue(val / 100.0)
+            finally:
+                spin_area_g.blockSignals(False)
 
-        slider_per_g.valueChanged.connect(lambda v: spin_per_g.setValue(v))
-        spin_per_g.valueChanged.connect(
-            lambda v: slider_per_g.setValue(int(v)))
+        def update_slider_area_g(val):
+            try:
+                slider_area_g.blockSignals(True)
+                slider_area_g.setValue(int(val * 100))
+            finally:
+                slider_area_g.blockSignals(False)
+            
+        slider_area_g.valueChanged.connect(update_spin_area_g)
+        spin_area_g.valueChanged.connect(update_slider_area_g)
 
-        slider_el_g.valueChanged.connect(
-            lambda v: spin_el_g.setValue(v / 10.0))
-        spin_el_g.valueChanged.connect(
-            lambda v: slider_el_g.setValue(int(v * 10)))
+        # CORREÇÃO: Usar a precisão do QDoubleSpinBox para o slider de perímetro
+        slider_per_g.setRange(0, 15000) # 0.00 a 150.00
+        slider_per_g.setValue(int(spin_per_g.value() * 100))
+        
+        def update_spin_per_g(val):
+            try:
+                spin_per_g.blockSignals(True)
+                spin_per_g.setValue(val / 100.0)
+            finally:
+                spin_per_g.blockSignals(False)
 
-        slider_rec_g.valueChanged.connect(
-            lambda v: spin_rec_g.setValue(v / 100.0))
-        spin_rec_g.valueChanged.connect(
-            lambda v: slider_rec_g.setValue(int(v * 100)))
+        def update_slider_per_g(val):
+            try:
+                slider_per_g.blockSignals(True)
+                slider_per_g.setValue(int(val * 100))
+            finally:
+                slider_per_g.blockSignals(False)
+            
+        slider_per_g.valueChanged.connect(update_spin_per_g)
+        spin_per_g.valueChanged.connect(update_slider_per_g)
+
+        # Elongation (Alargamento)
+        slider_el_g.setRange(0, 5000) # 0.0 a 500.0
+        slider_el_g.setValue(int(spin_el_g.value() * 10))
+        
+        def update_spin_el_g(val):
+            try:
+                spin_el_g.blockSignals(True)
+                spin_el_g.setValue(val / 10.0)
+            finally:
+                spin_el_g.blockSignals(False)
+
+        def update_slider_el_g(val):
+            try:
+                slider_el_g.blockSignals(True)
+                slider_el_g.setValue(int(val * 10))
+            finally:
+                slider_el_g.blockSignals(False)
+            
+        slider_el_g.valueChanged.connect(update_spin_el_g)
+        spin_el_g.valueChanged.connect(update_slider_el_g)
+
+        # Rectangularity (Retangularidade)
+        slider_rec_g.setRange(0, 100) # 0.00 a 1.00 (0 a 100 no slider)
+        slider_rec_g.setValue(int(spin_rec_g.value() * 100))
+        
+        def update_spin_rec_g(val):
+            try:
+                spin_rec_g.blockSignals(True)
+                spin_rec_g.setValue(val / 100.0)
+            finally:
+                spin_rec_g.blockSignals(False)
+
+        def update_slider_rec_g(val):
+            try:
+                slider_rec_g.blockSignals(True)
+                slider_rec_g.setValue(int(val * 100))
+            finally:
+                slider_rec_g.blockSignals(False)
+            
+        slider_rec_g.valueChanged.connect(update_spin_rec_g)
+        spin_rec_g.valueChanged.connect(update_slider_rec_g)
 
         # ---- Botões ----
         gain_btn_apply = QPushButton("Apply Filter (Gain)")
@@ -2868,29 +3658,96 @@ class UrbanChangeAid:
             "Min Perimeter:", 0, 150, 1)
         loss_elo_box, slider_el_l, spin_el_l = metric_slider(
             "Max Elongation:", 0, 500, 5, decimals=1, scale=10.0)
+        # CORREÇÃO 2: O slider de rectangularity estava usando o spin de elongation (slider_el_l)
         loss_rec_box, slider_rec_l, spin_rec_l = metric_slider(
-            "Min Rectangularity:", 0, 100, 1, decimals=2, scale=100.0)
+            "Min Rectangularity:", 0, 1.0, 0.01, decimals=2, scale=100.0)
 
         for box in [loss_area_box, loss_per_box, loss_elo_box, loss_rec_box]:
             loss_layout.addLayout(box)
 
-        slider_area_l.valueChanged.connect(lambda v: spin_area_l.setValue(v))
-        spin_area_l.valueChanged.connect(
-            lambda v: slider_area_l.setValue(int(v)))
+        # CORREÇÃO: Usar a precisão do QDoubleSpinBox para o slider de área (Loss)
+        slider_area_l.setRange(0, 20000) # 0.00 a 200.00
+        slider_area_l.setValue(int(spin_area_l.value() * 100))
+        
+        def update_spin_area_l(val):
+            try:
+                spin_area_l.blockSignals(True)
+                spin_area_l.setValue(val / 100.0)
+            finally:
+                spin_area_l.blockSignals(False)
 
-        slider_per_l.valueChanged.connect(lambda v: spin_per_l.setValue(v))
-        spin_per_l.valueChanged.connect(
-            lambda v: slider_per_l.setValue(int(v)))
+        def update_slider_area_l(val):
+            try:
+                slider_area_l.blockSignals(True)
+                slider_area_l.setValue(int(val * 100))
+            finally:
+                slider_area_l.blockSignals(False)
+            
+        slider_area_l.valueChanged.connect(update_spin_area_l)
+        spin_area_l.valueChanged.connect(update_slider_area_l)
 
-        slider_el_l.valueChanged.connect(
-            lambda v: spin_el_l.setValue(v / 10.0))
-        spin_el_l.valueChanged.connect(
-            lambda v: slider_el_l.setValue(int(v * 10)))
+        # CORREÇÃO: Usar a precisão do QDoubleSpinBox para o slider de perímetro (Loss)
+        slider_per_l.setRange(0, 15000) # 0.00 a 150.00
+        slider_per_l.setValue(int(spin_per_l.value() * 100))
+        
+        def update_spin_per_l(val):
+            try:
+                spin_per_l.blockSignals(True)
+                spin_per_l.setValue(val / 100.0)
+            finally:
+                spin_per_l.blockSignals(False)
 
-        slider_rec_l.valueChanged.connect(
-            lambda v: spin_rec_l.setValue(v / 100.0))
-        spin_rec_l.valueChanged.connect(
-            lambda v: slider_rec_l.setValue(int(v * 100)))
+        def update_slider_per_l(val):
+            try:
+                slider_per_l.blockSignals(True)
+                slider_per_l.setValue(int(val * 100))
+            finally:
+                slider_per_l.blockSignals(False)
+            
+        slider_per_l.valueChanged.connect(update_spin_per_l)
+        spin_per_l.valueChanged.connect(update_slider_per_l)
+
+        # Elongation (Alargamento) (Loss)
+        slider_el_l.setRange(0, 5000) # 0.0 a 500.0
+        slider_el_l.setValue(int(spin_el_l.value() * 10))
+        
+        def update_spin_el_l(val):
+            try:
+                spin_el_l.blockSignals(True)
+                spin_el_l.setValue(val / 10.0)
+            finally:
+                spin_el_l.blockSignals(False)
+
+        def update_slider_el_l(val):
+            try:
+                slider_el_l.blockSignals(True)
+                slider_el_l.setValue(int(val * 10))
+            finally:
+                slider_el_l.blockSignals(False)
+            
+        slider_el_l.valueChanged.connect(update_spin_el_l)
+        spin_el_l.valueChanged.connect(update_slider_el_l)
+
+        # Rectangularity (Retangularidade) (Loss)
+        slider_rec_l.setRange(0, 100) # 0.00 a 1.00 (0 a 100 no slider)
+        slider_rec_l.setValue(int(spin_rec_l.value() * 100))
+        
+        def update_spin_rec_l(val):
+            try:
+                spin_rec_l.blockSignals(True)
+                spin_rec_l.setValue(val / 100.0)
+            finally:
+                spin_rec_l.blockSignals(False)
+
+        def update_slider_rec_l(val):
+            try:
+                slider_rec_l.blockSignals(True)
+                slider_rec_l.setValue(int(val * 100))
+            finally:
+                slider_rec_l.blockSignals(False)
+            
+        slider_rec_l.valueChanged.connect(update_spin_rec_l)
+        spin_rec_l.valueChanged.connect(update_slider_rec_l)
 
         loss_btn_apply = QPushButton("Apply Filter (Loss)")
         loss_btn_export = QPushButton("Export Loss Selection")
@@ -2904,6 +3761,9 @@ class UrbanChangeAid:
         # ===============================
         def apply_filter(layer, canvas, is_gain=True):
             """Aplica filtros e atualiza seleção"""
+            # CORREÇÃO 2: Usar self._preview_dialog em vez de dlg
+            dlg = self._preview_dialog
+            
             if not layer or not layer.isValid():
                 QMessageBox.warning(dlg, "Warning", "Layer invalid.")
                 return
@@ -2947,11 +3807,11 @@ class UrbanChangeAid:
                 return
 
             # ← NOVO: Teste simples sem métricas - só is_valid e val
-            simple_expr = f'"is_valid" = 1 AND "val" = {255 if is_gain else 0}'
+            val_condition = 255
+            simple_expr = f'"is_valid" = 1 AND "val" = {val_condition}'
             layer.selectByExpression(simple_expr)
             simple_sel = layer.selectedFeatureCount()
-            self.log_message(
-                f"🔍 Simple test (is_valid=1 AND val={255 if is_gain else 0}): {simple_sel} selected")
+            self.log_message(f"🔍 Simple test (is_valid=1 AND val={val_condition}): {simple_sel} selected")
             layer.removeSelection()  # Limpa pra filtro completo
 
             try:
@@ -2962,7 +3822,8 @@ class UrbanChangeAid:
                          if is_gain else slider_el_l.value()) / 10.0
                 min_r = (slider_rec_g.value()
                          if is_gain else slider_rec_l.value()) / 100.0
-                val_condition = 255 if is_gain else 0
+                # Both gain and loss polygons use val==255 in polygonized outputs
+                val_condition = 255
 
                 # ← MUDANÇA: Expressão menos rígida - usa OR para condições opcionais se sliders em default (0/min)
                 # Se todos sliders em min/default, ignora métricas e usa só is_valid + val
@@ -3076,7 +3937,7 @@ class UrbanChangeAid:
 
         # ← NOVO: Antes de mostrar
         self.log_message("🚀 About to exec_() dialog...")
-        result = dlg.exec_()  # ← MUDANÇA: Captura o result
+        result = self._preview_dialog.exec_()  # ← MUDANÇA: Captura o result
         # ← NOVO: Depois de fechar
         self.log_message(
             f"🏁 Dialog closed with result: {result} (0=Reject, 1=Accept)")
@@ -3118,7 +3979,8 @@ class UrbanChangeAid:
             gain_layer.selectByExpression(expression_base + ' AND "val" = 255')
         if loss_layer:
             loss_layer.removeSelection()
-            loss_layer.selectByExpression(expression_base + ' AND "val" = 0')
+            # Loss polygons also use 255 in the raster value after polygonize/cleaning
+            loss_layer.selectByExpression(expression_base + ' AND "val" = 255')
 
     def export_from_preview(self, gain_layer, loss_layer):
         """Export direto da seleção no preview dialog."""
@@ -3134,12 +3996,164 @@ class UrbanChangeAid:
             QMessageBox.information(
                 self.dialog, "Success", f"Exported to {export_dir}")
 
-    def export_filtered_vectors(self):
-        """Exporta as features selecionadas (filtradas) para um shapefile."""
-        export_dir = QFileDialog.getExistingDirectory(
-            self.dialog, "Select Output Directory for Filtered Vectors")
+    def apply_smoothify(self):
+        """Aplica o algoritmo Smoothify nos vetores de entrada, procurando de forma inteligente
+        pelo arquivo correto (processado, filtrado ou exportando na hora)."""
+        try:
+            # 1. Obter parâmetros da UI
+            smooth_iterations = self.dialog.findChild(
+                QSpinBox, "smoothIterationsSpin").value()
+            segment_length = self.dialog.findChild(
+                QDoubleSpinBox, "segmentLengthSpin").value()
+            preserve_area = self.dialog.findChild(
+                QCheckBox, "preserveAreaCheck").isChecked()
+            area_tolerance = self.dialog.findChild(
+                QDoubleSpinBox, "areaToleranceSpin").value() / 100.0
+
+            # 2. Lógica inteligente para encontrar os arquivos de entrada corretos
+            gain_input_path = None
+            loss_input_path = None
+
+            # Prioridade 1: Verificar se existem arquivos processados (pós-simplify/orthogonalize)
+            processed_gain_path = os.path.join(
+                self.temp_dir, "gain_processed.shp")
+            processed_loss_path = os.path.join(
+                self.temp_dir, "loss_processed.shp")
+
+            if os.path.exists(processed_gain_path):
+                gain_input_path = processed_gain_path
+                self.log_message(
+                    "Found 'gain_processed.shp'. Using it for Smoothify.")
+            if os.path.exists(processed_loss_path):
+                loss_input_path = processed_loss_path
+                self.log_message(
+                    "Found 'loss_processed.shp'. Using it for Smoothify.")
+
+            # Prioridade 2: Se não encontrou os processados, procura pelos filtrados padrão
+            if not gain_input_path:
+                filtered_gain_path = os.path.join(
+                    self.temp_dir, "gain_filtered.shp")
+                if os.path.exists(filtered_gain_path):
+                    gain_input_path = filtered_gain_path
+                    self.log_message(
+                        "Found 'gain_filtered.shp'. Using it for Smoothify.")
+
+            if not loss_input_path:
+                filtered_loss_path = os.path.join(
+                    self.temp_dir, "loss_filtered.shp")
+                if os.path.exists(filtered_loss_path):
+                    loss_input_path = filtered_loss_path
+                    self.log_message(
+                        "Found 'loss_filtered.shp'. Using it for Smoothify.")
+
+            # Fallback: Se nenhum arquivo foi encontrado, tenta exportar da aba de Métricas
+            if not gain_input_path and not loss_input_path:
+                self.log_message(
+                    "No pre-existing vector files found. Attempting to export from Metrics tab...")
+                try:
+                    self._export_filtered_vectors_to_temp()
+                    # Re-verifica os caminhos após a exportação
+                    gain_input_path = self.filtered_gain_vector
+                    loss_input_path = self.filtered_loss_vector
+                except Exception as e:
+                    QMessageBox.warning(
+                        self.dialog, "Error", f"Could not obtain filtered vectors. Ensure layers 'Gain/Loss Vectors (with Metrics)' exist and have been filtered.\n\nError: {e}")
+                    self.log_message(
+                        f"Error during fallback export in Smoothify: {str(e)}")
+                    return
+
+            # Verificação final se temos pelo menos um arquivo para processar
+            if not gain_input_path and not loss_input_path:
+                QMessageBox.warning(self.dialog, "Input Not Found",
+                                    "Could not find or create any input vector files for Smoothify. Please complete the previous steps.")
+                return
+
+            # 3. Processar os vetores encontrados
+            if gain_input_path and os.path.exists(gain_input_path):
+                gain_layer = QgsVectorLayer(
+                    gain_input_path, "Input for Smoothify (Gain)", "ogr")
+                if gain_layer.isValid():
+                    self.smoothed_gain_vector_path = os.path.join(
+                        self.temp_dir, "smoothed_gain_vector.shp")
+                    self._process_layer_with_smoothify(
+                        gain_layer, self.smoothed_gain_vector_path, segment_length, smooth_iterations, preserve_area, area_tolerance, "Smoothed Gain Vector")
+                else:
+                    self.log_message(
+                        f"Warning: Could not load gain layer from {gain_input_path}")
+
+            if loss_input_path and os.path.exists(loss_input_path):
+                loss_layer = QgsVectorLayer(
+                    loss_input_path, "Input for Smoothify (Loss)", "ogr")
+                if loss_layer.isValid():
+                    self.smoothed_loss_vector_path = os.path.join(
+                        self.temp_dir, "smoothed_loss_vector.shp")
+                    self._process_layer_with_smoothify(
+                        loss_layer, self.smoothed_loss_vector_path, segment_length, smooth_iterations, preserve_area, area_tolerance, "Smoothed Loss Vector")
+                else:
+                    self.log_message(
+                        f"Warning: Could not load loss layer from {loss_input_path}")
+
+            QMessageBox.information(
+                self.dialog, "Success", "Smoothify applied successfully. Smoothed vectors loaded into the project.")
+
+        except Exception as e:
+            self.log_message(f"Error applying Smoothify: {str(e)}")
+            QMessageBox.warning(self.dialog, "Error",
+                                f"Error applying Smoothify: {str(e)}")
+
+    def _process_layer_with_smoothify(self, input_layer, output_path, segment_length, smooth_iterations, preserve_area, area_tolerance, output_name):
+        """Aplica Smoothify em uma camada vetorial e salva o resultado."""
+
+        # 1. Configurar o writer
+        fields = input_layer.fields()
+        writer = QgsVectorFileWriter(
+            output_path, 'UTF-8', fields, QgsWkbTypes.Polygon, input_layer.crs(), 'ESRI Shapefile')
+
+        if writer.hasError() != QgsVectorFileWriter.NoError:
+            raise Exception(
+                f"Error creating output file {output_path}: {writer.errorMessage()}")
+
+        # 2. Iterar sobre as features e aplicar Smoothify
+        for feature in input_layer.getFeatures():
+            geom = feature.geometry()
+            if not geom or geom.isEmpty():
+                continue
+
+            # Converter QgsGeometry para Shapely Geometry (Correção Problema 4)
+            # O método QgsWkbTypes.geometryToShapely() não está disponível em algumas versões do QGIS.
+            # Usamos a conversão via WKT, que é mais robusta.
+            shapely_geom = shapely_loads(geom.asWkt())
+
+            # Aplicar Smoothify
+            smoothed_shapely_geom = smoothify_geometry(
+                shapely_geom, segment_length, smooth_iterations, preserve_area, area_tolerance
+            )
+
+            # Converter Shapely Geometry de volta para QgsGeometry
+            smoothed_qgs_geom = QgsGeometry.fromWkt(smoothed_shapely_geom.wkt)
+
+            # Criar nova feature com a geometria suavizada
+            new_feature = QgsFeature(fields)
+            new_feature.setGeometry(smoothed_qgs_geom)
+            new_feature.setAttributes(feature.attributes())
+
+            writer.addFeature(new_feature)
+
+        del writer  # Fecha o arquivo
+
+        # 3. Carregar a camada suavizada no projeto
+        self._load_vector_to_project(output_path, output_name)
+
+    def export_filtered_vectors(self, export_dir=None, is_internal_call=False):
+        """
+        Exporta as features selecionadas (filtradas) para um shapefile usando QgsVectorFileWriter.
+        Esta é a versão robusta que evita erros do framework de processamento.
+        """
         if not export_dir:
-            return
+            export_dir = QFileDialog.getExistingDirectory(
+                self.dialog, "Select Output Directory for Filtered Vectors")
+            if not export_dir:
+                return None, None
 
         try:
             gain_layers = QgsProject.instance().mapLayersByName("Gain Vectors (with Metrics)")
@@ -3148,381 +4162,977 @@ class UrbanChangeAid:
             gain_output_path = None
             loss_output_path = None
 
-            # Exporta Gain Vectors selecionados (com filtro is_valid)
-            if gain_layers and len(gain_layers) > 0:
+            # Função auxiliar para escrever o shapefile de forma segura
+            def write_shapefile(layer, output_path):
+                if not layer:
+                    return False
+
+                if layer.selectedFeatureCount() == 0:
+                    if "Gain" in layer.name():
+                        layer.selectByExpression(
+                            '"is_valid" = 1 AND "val" = 255')
+                    else:
+                        layer.selectByExpression(
+                            '"is_valid" = 1 AND "val" = 0')
+
+                if layer.selectedFeatureCount() == 0:
+                    self.log_message(
+                        f"No features to export for layer {layer.name()}.")
+                    return False
+
+                writer = QgsVectorFileWriter(
+                    output_path, 'UTF-8', layer.fields(),
+                    layer.wkbType(), layer.crs(), "ESRI Shapefile"
+                )
+
+                if writer.hasError() != QgsVectorFileWriter.NoError:
+                    raise Exception(
+                        f"Failed to create shapefile writer for {output_path}: {writer.errorMessage()}")
+
+                for feature in layer.selectedFeatures():
+                    writer.addFeature(feature)
+
+                del writer
+                return True
+
+            # Exporta Gain Vectors
+            if gain_layers:
                 gain_layer = gain_layers[0]
-                # Seleciona só válidas antes de export (evita ruído)
-                if gain_layer.selectedFeatureCount() == 0:
-                    gain_layer.selectByExpression(
-                        '"is_valid" = 1 AND "val" = 255')
                 gain_output_path = os.path.join(
-                    export_dir, "filtered_gain_vectors.shp")
-                params = {
-                    'INPUT': gain_layer,
-                    'OUTPUT': gain_output_path
-                }
-                result = processing.run("native:saveselectedfeatures", params)
-                self.log_message(
-                    f"Filtered Gain Vectors exported to {gain_output_path} ({gain_layer.selectedFeatureCount()} features)")
-                QMessageBox.information(
-                    self.dialog, "Success", f"Filtered Gain Vectors exported to {gain_output_path}")
+                    export_dir, "gain_filtered.shp")
+                if write_shapefile(gain_layer, gain_output_path):
+                    self.log_message(
+                        f"Filtered Gain Vectors exported to {gain_output_path} ({gain_layer.selectedFeatureCount()} features)")
+                    if not is_internal_call:
+                        QMessageBox.information(
+                            self.dialog, "Success", f"Filtered Gain Vectors exported to {gain_output_path}")
+                elif not is_internal_call:
+                    QMessageBox.warning(
+                        self.dialog, "Warning", "No valid features to export for Gain layer.")
 
-            # Exporta Loss Vectors selecionados (com filtro is_valid)
-            if loss_layers and len(loss_layers) > 0:
+            # Exporta Loss Vectors
+            if loss_layers:
                 loss_layer = loss_layers[0]
-                if loss_layer.selectedFeatureCount() == 0:
-                    loss_layer.selectByExpression(
-                        '"is_valid" = 1 AND "val" = 0')
                 loss_output_path = os.path.join(
-                    export_dir, "filtered_loss_vectors.shp")
-                params = {
-                    'INPUT': loss_layer,
-                    'OUTPUT': loss_output_path
-                }
-                result = processing.run("native:saveselectedfeatures", params)
-                self.log_message(
-                    f"Filtered Loss Vectors exported to {loss_output_path} ({loss_layer.selectedFeatureCount()} features)")
-                QMessageBox.information(
-                    self.dialog, "Success", f"Filtered Loss Vectors exported to {loss_output_path}")
+                    export_dir, "loss_filtered.shp")
+                if write_shapefile(loss_layer, loss_output_path):
+                    self.log_message(
+                        f"Filtered Loss Vectors exported to {loss_output_path} ({loss_layer.selectedFeatureCount()} features)")
+                    if not is_internal_call:
+                        QMessageBox.information(
+                            self.dialog, "Success", f"Filtered Loss Vectors exported to {loss_output_path}")
+                elif not is_internal_call:
+                    QMessageBox.warning(
+                        self.dialog, "Warning", "No valid features to export for Loss layer.")
 
-            self.filtered_gain_vector = gain_output_path
-            self.filtered_loss_vector = loss_output_path
+            return gain_output_path, loss_output_path
 
         except Exception as e:
-            self.log_message(f"Error exporting filtered vectors: {str(e)}")
-            QMessageBox.warning(self.dialog, "Error",
-                                f"Error exporting filtered vectors: {str(e)}")
+            error_msg = f"Error exporting filtered vectors: {str(e)}"
+            self.log_message(error_msg)
+            if not is_internal_call:
+                QMessageBox.critical(self.dialog, "Error", error_msg)
+            raise Exception(error_msg)
 
-    def next_to_centroids(self):
-        """Avança para o tab de centroids (sem calcular nada automaticamente)."""
+    def _export_filtered_vectors_to_temp(self):
+        """Exporta os vetores filtrados para o diretório temporário do plugin."""
+        self.log_message(
+            "Attempting to export filtered vectors to temp directory for Smoothify.")
+        temp_dir = self.temp_dir
+
+        try:
+            gain_output_path, loss_output_path = self.export_filtered_vectors(
+                export_dir=temp_dir, is_internal_call=True)
+
+            if gain_output_path and os.path.exists(gain_output_path):
+                self.filtered_gain_vector = gain_output_path
+            else:
+                self.filtered_gain_vector = None
+
+            if loss_output_path and os.path.exists(loss_output_path):
+                self.filtered_loss_vector = loss_output_path
+            else:
+                self.filtered_loss_vector = None
+
+            self.log_message(
+                f"Filtered vectors exported to temp: Gain={self.filtered_gain_vector}, Loss={self.filtered_loss_vector}")
+
+            if not self.filtered_gain_vector and not self.filtered_loss_vector:
+                raise Exception(
+                    "Export process completed, but no output files were generated.")
+
+        except Exception as e:
+            self.log_message(
+                f"Failed during _export_filtered_vectors_to_temp: {e}")
+            raise
+
+    def generate_centroids(self):
+        """Gera centroides a partir dos vetores filtrados (gain/loss) e carrega no projeto.
+
+        - Procura por camadas filtradas exportadas em `self.filtered_gain_vector` e
+          `self.filtered_loss_vector` ou tenta exportá-las para o diretório temporário.
+        - Calcula centroides das feições selecionadas/filtradas e salva em shapefile
+          temporário dentro de `self.temp_dir` como `centroids_gain.shp` e
+          `centroids_loss.shp`.
+        - Adiciona as camadas de centroides ao projeto QGIS.
+        """
+        try:
+            # Candidate filenames to look for (in project layers or temp directory)
+            candidate_names = {
+                'gain': [
+                    'gain_filtered.shp',
+                    'gain_processed.shp',
+                    'smoothed_gain_vector.shp'
+                ],
+                'loss': [
+                    'loss_filtered.shp',
+                    'loss_processed.shp',
+                    'smoothed_loss_vector.shp'
+                ]
+            }
+
+            # Helper to normalize layer source to a filesystem path when possible
+            from urllib.parse import unquote
+
+            def _src_to_path(src: str) -> str:
+                if not src:
+                    return ''
+                s = src.replace('\\', '/')
+                # shapefile sources in QGIS sometimes have a | at the end with layer options
+                if '|' in s:
+                    s = s.split('|')[0]
+                # file URI
+                if s.startswith('file://'):
+                    p = s[7:]
+                    # On Windows the file URI may start with an extra leading '/'
+                    if os.name == 'nt' and p.startswith('/') and len(p) > 2 and p[2] == ':':
+                        p = p[1:]
+                    return unquote(p)
+                return unquote(s)
+
+            # Gather candidates from project layers and known temp files / attributes
+            candidates = []  # list of dicts: {'role','path','label'}
+
+            # 1) Inspect loaded project layers
+            for lyr in QgsProject.instance().mapLayers().values():
+                try:
+                    src = lyr.source()
+                except Exception:
+                    try:
+                        src = lyr.dataProvider().dataSourceUri()
+                    except Exception:
+                        src = ''
+
+                if not src:
+                    continue
+
+                path = _src_to_path(src)
+                base = os.path.basename(path).lower()
+                for role, names in candidate_names.items():
+                    for name in names:
+                        if base == name.lower() or name.lower() in path.lower():
+                            candidates.append({'role': role, 'path': path, 'label': f"{role.title()}: {os.path.basename(path)} (layer {lyr.name()})"})
+
+            # 2) Inspect attributes and temp dir files (fallbacks)
+            # - self.filtered_gain_vector / filtered_loss_vector
+            for attr_name, role_hint in [('filtered_gain_vector', 'gain'), ('filtered_loss_vector', 'loss')]:
+                p = getattr(self, attr_name, None)
+                if p:
+                    p_norm = _src_to_path(p)
+                    if p_norm and os.path.exists(p_norm):
+                        candidates.append({'role': role_hint, 'path': p_norm, 'label': f"{role_hint.title()}: {os.path.basename(p_norm)} (filtered attr)"})
+
+            # - look for standard filenames in temp_dir
+            for role, names in candidate_names.items():
+                for name in names:
+                    temp_path = os.path.join(self.temp_dir, name)
+                    if os.path.exists(temp_path):
+                        candidates.append({'role': role, 'path': temp_path, 'label': f"{role.title()}: {name} (temp)"})
+
+            # Deduplicate by path (keep first)
+            seen = set()
+            uniq = []
+            for c in candidates:
+                pnorm = os.path.normpath(c['path']) if c.get('path') else c.get('path')
+                if not pnorm:
+                    continue
+                if pnorm in seen:
+                    continue
+                seen.add(pnorm)
+                uniq.append(c)
+            candidates = uniq
+
+            # If no candidates found, try exporting filtered vectors to temp then re-scan
+            if not candidates:
+                try:
+                    self._export_filtered_vectors_to_temp()
+                except Exception as e:
+                    self.log_message(f"Could not export filtered vectors to temp: {e}")
+
+                # re-check temp paths
+                for role, names in candidate_names.items():
+                    for name in names:
+                        temp_path = os.path.join(self.temp_dir, name)
+                        if os.path.exists(temp_path):
+                            candidates.append({'role': role, 'path': temp_path, 'label': f"{role.title()}: {name} (temp)"})
+
+            if not candidates:
+                QMessageBox.warning(self.dialog, 'Warning', 'No candidate input vector files found for centroids.')
+                self.log_message('No candidate centroid inputs found in project or temp dir.')
+                return
+
+            # Build selection dialog so user can pick which inputs to generate centroids for
+            dlg = QDialog(self.dialog)
+            dlg.setWindowTitle('Select Inputs for Centroids')
+            dlg_layout = QVBoxLayout(dlg)
+            dlg_layout.addWidget(QLabel('Select which input vector(s) to generate centroids from:'))
+
+            chk_list = []
+            for c in candidates:
+                chk = QCheckBox(c['label'])
+                chk.setChecked(True)
+                dlg_layout.addWidget(chk)
+                chk_list.append(chk)
+
+            btn_box = QHBoxLayout()
+            ok_btn = QPushButton('Generate')
+            cancel_btn = QPushButton('Cancel')
+            btn_box.addWidget(ok_btn)
+            btn_box.addWidget(cancel_btn)
+            dlg_layout.addLayout(btn_box)
+
+            ok_btn.clicked.connect(dlg.accept)
+            cancel_btn.clicked.connect(dlg.reject)
+
+            if dlg.exec_() != QDialog.Accepted:
+                self.log_message('Centroid generation cancelled by user.')
+                return
+
+            selected = [c for c, ch in zip(candidates, chk_list) if ch.isChecked()]
+            if not selected:
+                QMessageBox.information(self.dialog, 'Info', 'No inputs selected for centroids.')
+                return
+
+            created = []
+            for sel in selected:
+                in_src = sel['path']
+                # normalize path again
+                in_path = _src_to_path(in_src)
+                if not in_path or not os.path.exists(in_path):
+                    self.log_message(f"Skipping missing input: {in_src}")
+                    continue
+
+                out_name = f"centroids_{sel['role']}_{os.path.splitext(os.path.basename(in_path))[0]}.shp"
+                out_path = os.path.join(self.temp_dir, out_name)
+
+                try:
+                    params = {
+                        'INPUT': in_path,
+                        'ALL_PARTS': False,
+                        'OUTPUT': out_path
+                    }
+                    result = processing.run('native:centroids', params)
+                    out_res = result.get('OUTPUT') or result.get('OUTPUT_LAYER') or result.get('OUTPUT_RASTER')
+                    final_path = out_res if out_res else out_path
+                    if final_path and os.path.exists(final_path):
+                        layer_name = f"Centroids - {sel['role'].title()} - {os.path.splitext(os.path.basename(in_path))[0]}"
+                        cent_lyr = QgsVectorLayer(final_path, layer_name, 'ogr')
+                        if cent_lyr.isValid():
+                            QgsProject.instance().addMapLayer(cent_lyr)
+                            created.append(final_path)
+                            self.log_message(f"Centroids generated and added: {final_path}")
+                        else:
+                            self.log_message(f"Centroid output invalid: {final_path}")
+                    else:
+                        self.log_message(f"Centroid algorithm did not return output for {in_path}")
+                except Exception as e:
+                    self.log_message(f"Error creating centroids for {in_path}: {e}")
+
+            if created:
+                QMessageBox.information(self.dialog, 'Success', f"Centroids generated and loaded ({len(created)}). Check project layers.")
+            else:
+                QMessageBox.information(self.dialog, 'Info', 'No centroid layers created.')
+
+        except Exception as e:
+            self.log_message(f"Error generating centroids: {e}")
+            QMessageBox.warning(self.dialog, 'Error', f'Error generating centroids: {e}')
+
+    # --- Smoothify Functions (Copied from smoothify_core.py) ---
+
+
+def _chaikin_corner_cutting(
+    geom: Polygon | LineString, num_iterations: int = 1, reverse: bool = False
+) -> Polygon | LineString:
+    """Apply Chaikin's corner cutting algorithm to smooth a geometry.
+
+    Chaikin's algorithm iteratively replaces each line segment with two new segments
+    by cutting corners at 1/4 and 3/4 positions, creating a smooth curve. This
+    implementation uses vectorized NumPy operations for performance and handles
+    both closed (Polygon) and open (LineString) geometries.
+    """
+
+    is_closed = isinstance(geom, Polygon)
+    points = np.array(
+        geom.exterior.coords if is_closed else geom.coords, dtype=np.float64
+    )
+
+    if is_closed:
+        # Remove duplicate endpoint for closed rings
+        points = points[:-1]
+        endpoints = None
+    else:
+        # Store endpoints for open linestrings
+        endpoints = (points[0], points[-1])
+
+    if reverse:
+        points = points[::-1]
+
+    for _ in range(num_iterations):
+        # Get point pairs for corner cutting
+        if is_closed:
+            p0 = points
+            p1 = np.roll(points, -1, axis=0)
+        else:
+            p0 = points[:-1]
+            p1 = points[1:]
+
+        # Vectorized smoothing at 1/4 and 3/4 positions
+        # Pre-allocate result array for better performance
+        n_new_points = len(p0) * 2
+        points = np.empty((n_new_points, 2), dtype=np.float64)
+        points[0::2] = 0.75 * p0 + 0.25 * p1  # q points
+        points[1::2] = 0.25 * p0 + 0.75 * p1  # r points
+
+    if not is_closed:
+        # Restore original endpoints for open linestrings
+        points = np.vstack([endpoints[0], points, endpoints[1]])
+
+    # Reconstruct the geometry
+    if is_closed:
+        # Close the ring for Polygon
+        points = np.vstack([points, points[0]])
+        return Polygon(points)
+    else:
+        return LineString(points)
+
+
+def _smooth_geometry(
+    geom: BaseGeometry,
+    segment_length: float,
+    smooth_iterations: int,
+    preserve_area: bool,
+    area_tolerance: float,
+) -> BaseGeometry:
+    """Internal function to smooth a single geometry."""
+
+    if geom.is_empty:
+        return geom
+
+    # 1. Segmentize (add intermediate vertices)
+    # This is crucial for Chaikin's algorithm to work well on pixelated geometries
+    # The number of segments is calculated to ensure segments are roughly segment_length long
+    if isinstance(geom, (Polygon, LineString)):
+        # Calculate number of segments to add
+        length = geom.length
+        num_segments = max(1, int(np.ceil(length / segment_length)))
+        geom = geom.segmentize(length / num_segments)
+    elif isinstance(geom, LinearRing):
+        # LinearRing is treated as a closed LineString for segmentize
+        length = geom.length
+        num_segments = max(1, int(np.ceil(length / segment_length)))
+        # Convert to LineString, segmentize, then back to LinearRing
+        ls = LineString(geom.coords)
+        ls = ls.segmentize(length / num_segments)
+        geom = LinearRing(ls.coords)
+
+    # 2. Apply Chaikin's corner cutting
+    if isinstance(geom, (Polygon, LineString)):
+        smoothed_geom = _chaikin_corner_cutting(
+            geom, num_iterations=smooth_iterations
+        )
+    elif isinstance(geom, LinearRing):
+        # Apply to LinearRing's coordinates
+        ls = LineString(geom.coords)
+        smoothed_ls = _chaikin_corner_cutting(
+            ls, num_iterations=smooth_iterations
+        )
+        smoothed_geom = LinearRing(smoothed_ls.coords)
+    else:
+        # Unsupported geometry type for smoothing (e.g., Point, MultiPoint)
+        return geom
+
+    # 3. Optional: Preserve area for Polygons
+    if preserve_area and isinstance(smoothed_geom, Polygon):
+        original_area = geom.area
+        smoothed_area = smoothed_geom.area
+
+        # Use brentq to find the buffer distance that restores the area
+        def area_error(buffer_dist):
+            buffered_geom = smoothed_geom.buffer(buffer_dist)
+            # Ensure the buffered geometry is valid and a Polygon
+            if not buffered_geom.is_valid:
+                buffered_geom = make_valid(buffered_geom)
+            if isinstance(buffered_geom, Polygon):
+                return buffered_geom.area - original_area
+            elif isinstance(buffered_geom, MultiPolygon):
+                # If it becomes a MultiPolygon, use the area of the largest part
+                return max(p.area for p in buffered_geom.geoms) - original_area
+            else:
+                # If it becomes another type (e.g., LineString, Point),
+                # this is an edge case, return a large error
+                return 1e12
+
+        # Find the root (buffer distance)
+        # The search range is typically small, e.g., -10 to 10 map units
+        try:
+            buffer_distance = brentq(
+                area_error, -10.0, 10.0, xtol=area_tolerance)
+            smoothed_geom = smoothed_geom.buffer(buffer_distance)
+            if not smoothed_geom.is_valid:
+                smoothed_geom = make_valid(smoothed_geom)
+        except ValueError:
+            # Root not found in the interval, or other error. Return the smoothed geometry without area preservation.
+            pass
+
+    return smoothed_geom
+
+
+def smoothify_geometry(
+    geom: BaseGeometry,
+    segment_length: float,
+    smooth_iterations: int = 3,
+    preserve_area: bool = True,
+    area_tolerance: float = 0.01,
+) -> BaseGeometry:
+    """
+    Applies Chaikin's corner cutting algorithm to smooth a single geometry.
+
+    Parameters
+    ----------
+    geom : BaseGeometry
+        The geometry to smooth.
+    segment_length : float
+        Resolution of the original raster data in map units. Used for segmentization.
+    smooth_iterations : int, optional
+        Number of Chaikin corner-cutting iterations (typically 3-5). The default is 3.
+    preserve_area : bool, optional
+        Whether to restore original area after smoothing via buffering (applies to Polygons only). The default is True.
+    area_tolerance : float, optional
+        Percentage of original area allowed as error (e.g., 0.01 = 0.01% error = 99.99% preservation).
+        Only affects Polygons when preserve_area=True. The default is 0.01.
+
+    Returns
+    -------
+    BaseGeometry
+        The smoothed geometry.
+    """
+    if isinstance(geom, (Polygon, LineString, LinearRing)):
+        return _smooth_geometry(
+            geom, segment_length, smooth_iterations, preserve_area, area_tolerance
+        )
+    elif isinstance(geom, GeometryCollection):
+        # Recursively smooth geometries in the collection
+        smoothed_geoms = [
+            smoothify_geometry(
+                g, segment_length, smooth_iterations, preserve_area, area_tolerance
+            )
+            for g in geom.geoms
+        ]
+        # Attempt to union the results back into a single geometry if possible
+        try:
+            return unary_union(smoothed_geoms)
+        except Exception:
+            # If union fails, return the collection
+            return GeometryCollection(smoothed_geoms)
+    elif hasattr(geom, "geoms"):
+        # Handle Multi-geometries (MultiPolygon, MultiLineString)
+        # Smooth each part, taking care to flatten nested Multi-geometries
+        parts = []
+        for g in geom.geoms:
+            sm = _smooth_geometry(
+                g, segment_length, smooth_iterations, preserve_area, area_tolerance
+            )
+            # If the result is a MultiPolygon (or other multi), extend its parts
+            if isinstance(sm, MultiPolygon):
+                parts.extend(list(sm.geoms))
+            elif hasattr(sm, 'geoms'):
+                # generic multi-geometry (e.g., MultiLineString)
+                parts.extend(list(sm.geoms))
+            else:
+                parts.append(sm)
+
+        # Reconstruct appropriate multi-type
+        if isinstance(geom, MultiPolygon):
+            # ensure all parts are Polygons
+            poly_parts = [p for p in parts if isinstance(p, Polygon)]
+            return MultiPolygon(poly_parts)
+        else:
+            # For other multi-types (e.g., MultiLineString), try to rebuild using unary_union
+            try:
+                return unary_union(parts)
+            except Exception:
+                return geom
+    else:
+        # Other types (Point, MultiPoint) are returned as is
+        return geom
+
+    def next_to_export(self):
+        """Avança para o tab Export & Finish (sem calcular nada automaticamente)."""
         try:
             # Pega o atual (deve ser 8 pra Metrics)
             current_index = self.dialog.tabWidget.currentIndex()
-            next_index = current_index + 1  # Próximo (9 pra Centroids)
-            # ← FIX: Habilita o tab (e seus botões filhos)
+            next_index = current_index + 1  # Próximo (9 pra Export & Finish)
+            # Habilita o tab (e seus botões filhos)
             self.dialog.tabWidget.setTabEnabled(next_index, True)
             self.dialog.tabWidget.setCurrentIndex(next_index)  # Avança
             self.log_message(
-                f"➡️ Advanced from tab {current_index} to {next_index} (Centroids). Buttons now enabled.")
+                f"➡️ Advanced from tab {current_index} to {next_index} (Export & Finish). Buttons now enabled.")
         except Exception as e:
-            self.log_message(f"Error advancing to centroids tab: {str(e)}")
+            self.log_message(
+                f"Error advancing to Export & Finish tab: {str(e)}")
             QMessageBox.warning(self.dialog, "Error",
                                 f"Error advancing: {str(e)}")
 
-    def generate_centroids(self):
-        """Gera os centroides de TODAS as features nas layers filtradas (Filtered Gain/Loss) usando o algoritmo nativo do QGIS."""
-        try:
-            # Busca layers FILTRADAS (depois do export)
-            gain_layers = QgsProject.instance().mapLayersByName("Filtered Gain")
-            loss_layers = QgsProject.instance().mapLayersByName("Filtered Loss")
-
-            if not (gain_layers or loss_layers):
-                QMessageBox.warning(
-                    self.dialog, "Warning", "No filtered layers available (Filtered Gain/Loss). Run 'Preview Filtered Vectors' > 'Export Selection' first.")
-                self.log_message(
-                    "No filtered layers found — run export before centroids.")
-                return
-
-            centroids_generated = False
-
-            # Processa Filtered Gain (TODAS as features)
-            if gain_layers and len(gain_layers) > 0:
-                gain_layer = gain_layers[0]
-                if gain_layer.featureCount() > 0:
-                    centroid_path = os.path.join(
-                        self.temp_dir, "filtered_gain_centroids.shp")
-                    params = {
-                        'INPUT': gain_layer,
-                        'ALL_PARTS': False,  # Padrão para centroides simples
-                        'OUTPUT': centroid_path
-                    }
-                    result = processing.run("native:centroids", params)
-                    if 'OUTPUT' in result:
-                        centroid_layer = QgsVectorLayer(
-                            result['OUTPUT'], "Filtered Gain Centroids", "ogr")
-                        if centroid_layer.isValid():
-                            QgsProject.instance().addMapLayer(centroid_layer)
-                            self.log_message(
-                                f"✅ Centroids generated for Filtered Gain ({centroid_layer.featureCount()} points) and loaded in project.")
-                            centroids_generated = True
-                        else:
-                            self.log_message(
-                                "Warning: Invalid centroid layer for Filtered Gain.")
-                    else:
-                        self.log_message(
-                            "Error: No output from centroids algorithm for Filtered Gain.")
-            else:
-                self.log_message("Filtered Gain layer has no features.")
-
-            # Processa Filtered Loss (TODAS as features)
-            if loss_layers and len(loss_layers) > 0:
-                loss_layer = loss_layers[0]
-                if loss_layer.featureCount() > 0:
-                    centroid_path = os.path.join(
-                        self.temp_dir, "filtered_loss_centroids.shp")
-                    params = {
-                        'INPUT': loss_layer,
-                        'ALL_PARTS': False,  # Padrão para centroides simples
-                        'OUTPUT': centroid_path
-                    }
-                    result = processing.run("native:centroids", params)
-                    if 'OUTPUT' in result:
-                        centroid_layer = QgsVectorLayer(
-                            result['OUTPUT'], "Filtered Loss Centroids", "ogr")
-                        if centroid_layer.isValid():
-                            QgsProject.instance().addMapLayer(centroid_layer)
-                            self.log_message(
-                                f"✅ Centroids generated for Filtered Loss ({centroid_layer.featureCount()} points) and loaded in project.")
-                            centroids_generated = True
-                        else:
-                            self.log_message(
-                                "Warning: Invalid centroid layer for Filtered Loss.")
-                    else:
-                        self.log_message(
-                            "Error: No output from centroids algorithm for Filtered Loss.")
-                else:
-                    self.log_message("Filtered Loss layer has no features.")
-
-            if centroids_generated:
-                self.log_message(
-                    "Centroid generation completed from all filtered features. Proceed to clustering/export.")
-                QMessageBox.information(
-                    self.dialog, "Success", f"Centroids generated from filtered layers. Check project layers (e.g., Filtered Gain Centroids).")
-            else:
-                self.log_message(
-                    "No centroids generated — filtered layers empty.")
-
-        except Exception as e:
-            self.log_message(f"Error generating centroids: {str(e)}")
-            QMessageBox.warning(self.dialog, "Error",
-                                f"Error generating centroids: {str(e)}")
-
-    def generate_heatmaps(self):
-        """Gera heatmaps opcionais a partir dos centroids de Filtered Gain/Loss, com escolha do usuário."""
-        try:
-            # Busca layers de centroids
-            gain_centroids_layers = QgsProject.instance(
-            ).mapLayersByName("Filtered Gain Centroids")
-            loss_centroids_layers = QgsProject.instance(
-            ).mapLayersByName("Filtered Loss Centroids")
-
-            if not (gain_centroids_layers or loss_centroids_layers):
-                QMessageBox.warning(self.dialog, "Warning",
-                                    "No centroid layers available (Filtered Gain/Loss Centroids). Generate centroids first.")
-                self.log_message(
-                    "No centroid layers found — generate centroids before heatmaps.")
-                return
-
-            # Dialog para escolha (Gain, Loss ou Both)
-            choice_dlg = QDialog(self.dialog)
-            choice_dlg.setWindowTitle("Generate Heatmaps")
-            choice_layout = QVBoxLayout(choice_dlg)
-
-            group_box = QGroupBox("Select which heatmaps to generate:")
-            group_layout = QVBoxLayout(group_box)
-            radio_gain = QRadioButton("Gain Centroids Only")
-            radio_loss = QRadioButton("Loss Centroids Only")
-            radio_both = QRadioButton("Both Gain and Loss")
-            radio_both.setChecked(True)  # Default: Both
-            group_layout.addWidget(radio_gain)
-            group_layout.addWidget(radio_loss)
-            group_layout.addWidget(radio_both)
-            choice_layout.addWidget(group_box)
-
-            # Slider para Radius (opcional, default 1000m)
-            radius_box = QHBoxLayout()
-            radius_lbl = QLabel("Kernel Radius (map units, e.g., meters):")
-            radius_spin = QDoubleSpinBox()
-            radius_spin.setRange(1, 100000)
-            radius_spin.setValue(1000)
-            radius_spin.setSingleStep(100)
-            radius_box.addWidget(radius_lbl)
-            radius_box.addWidget(radius_spin)
-            choice_layout.addLayout(radius_box)
-
-            # Botões OK/Cancel
-            btn_layout = QHBoxLayout()
-            ok_btn = QPushButton("Generate")
-            cancel_btn = QPushButton("Cancel")
-            btn_layout.addWidget(ok_btn)
-            btn_layout.addWidget(cancel_btn)
-            choice_layout.addLayout(btn_layout)
-
-            def generate_selected():
-                radius = radius_spin.value()
-                heatmaps_generated = False
-
-                # Processa Gain se selecionado
-                if radio_gain.isChecked() or radio_both.isChecked():
-                    if gain_centroids_layers:
-                        gain_centroids = gain_centroids_layers[0]
-                        if gain_centroids.featureCount() > 0:
-                            heatmap_path = os.path.join(
-                                self.temp_dir, "gain_heatmap.tif")
-                            params = {
-                                'INPUT': gain_centroids,
-                                'RADIUS': radius,
-                                'PIXEL_SIZE': 10,  # Ajuste para resolução desejada
-                                'KERNEL': 0,  # Quartic (default)
-                                'OUTPUT': heatmap_path
-                            }
-                            # processamento: use .get to be resilient ao formato de retorno
-                            result = processing.run(
-                                "qgis:heatmapkerneldensityestimation", params)
-                            out_path = result.get('OUTPUT') or result.get(
-                                'OUTPUT_RASTER') or result.get('OUTPUT_LAYER')
-                            if out_path:
-                                heatmap_layer = QgsRasterLayer(
-                                    out_path, "Gain Heatmap")
-                                if heatmap_layer.isValid():
-                                    QgsProject.instance().addMapLayer(heatmap_layer)
-                                    self.log_message(
-                                        f"✅ Gain Heatmap generated ({radius}m radius) and loaded in project.")
-                                    heatmaps_generated = True
-                                else:
-                                    self.log_message(
-                                        "Warning: Invalid Gain Heatmap layer.")
-                        else:
-                            self.log_message(
-                                "Filtered Gain Centroids has no features.")
-
-                # Processa Loss se selecionado
-                if radio_loss.isChecked() or radio_both.isChecked():
-                    if loss_centroids_layers:
-                        loss_centroids = loss_centroids_layers[0]
-                        if loss_centroids.featureCount() > 0:
-                            heatmap_path = os.path.join(
-                                self.temp_dir, "loss_heatmap.tif")
-                            params = {
-                                'INPUT': loss_centroids,
-                                'RADIUS': radius,
-                                'PIXEL_SIZE': 10,  # Ajuste para resolução desejada
-                                'KERNEL': 0,  # Quartic (default)
-                                'OUTPUT': heatmap_path
-                            }
-                            result = processing.run(
-                                "qgis:heatmapkerneldensityestimation", params)
-                            out_path = result.get('OUTPUT') or result.get(
-                                'OUTPUT_RASTER') or result.get('OUTPUT_LAYER')
-                            if out_path:
-                                heatmap_layer = QgsRasterLayer(
-                                    out_path, "Loss Heatmap")
-                                if heatmap_layer.isValid():
-                                    QgsProject.instance().addMapLayer(heatmap_layer)
-                                    self.log_message(
-                                        f"✅ Loss Heatmap generated ({radius}m radius) and loaded in project.")
-                                    heatmaps_generated = True
-                                else:
-                                    self.log_message(
-                                        "Warning: Invalid Loss Heatmap layer.")
-                        else:
-                            self.log_message(
-                                "Filtered Loss Centroids has no features.")
-
-                if heatmaps_generated:
-                    QMessageBox.information(
-                        self.dialog, "Success", "Heatmaps generated and loaded. They will be included in Export All if in temp dir.")
-                else:
-                    self.log_message(
-                        "No heatmaps generated — no centroid features available.")
-                choice_dlg.accept()
-
-            ok_btn.clicked.connect(generate_selected)
-            cancel_btn.clicked.connect(choice_dlg.reject)
-
-            choice_dlg.exec_()
-
-        except Exception as e:
-            self.log_message(f"Error generating heatmaps: {str(e)}")
-            QMessageBox.warning(self.dialog, "Error",
-                                f"Error generating heatmaps: {str(e)}")
-
-    def export_all_results(self):
-        """Exporta todos os resultados do diretório temporário para um diretório escolhido, com opção de selecionar o que salvar."""
-        export_dir = QFileDialog.getExistingDirectory(
-            self.dialog, "Select Output Directory for All Results")
-        if not export_dir:
+    def orthogonalize_or_simplify(self):
+        if not self.gain_mask_path or not self.loss_mask_path or not os.path.exists(self.gain_mask_path) or not os.path.exists(self.loss_mask_path):
+            QMessageBox.warning(self.dialog, "Warning",
+                                "Generate the gain and loss masks first.")
             return
 
-        try:
-            # Lista todos os arquivos no temp_dir (filtros para .shp, .tif, etc.)
-            files_in_temp = [f for f in os.listdir(
-                self.temp_dir) if os.path.isfile(os.path.join(self.temp_dir, f))]
-            if not files_in_temp:
-                self.log_message("No files found in temp directory to export.")
-                QMessageBox.information(
-                    self.dialog, "Info", "No files available in temp directory.")
-                return
+        ds_gain = gdal.Open(self.gain_mask_path)
+        ds_loss = gdal.Open(self.loss_mask_path)
+        arr_gain = ds_gain.ReadAsArray()
+        arr_loss = ds_loss.ReadAsArray()
+        preview_gain = arr_gain[::4,
+                                ::4] if arr_gain.shape[0] > 800 else arr_gain
+        preview_loss = arr_loss[::4,
+                                ::4] if arr_loss.shape[0] > 800 else arr_loss
+        ds_gain = None
+        ds_loss = None
+        arr_bin_gain = (preview_gain == 255).astype(np.uint8)
+        arr_bin_loss = (preview_loss == 255).astype(np.uint8)
 
-            # Cria dialog para seleção (com checkboxes)
-            select_dlg = QDialog(self.dialog)
-            select_dlg.setWindowTitle("Select Files to Export")
-            # ← FIX: Modal pra não sumir ao clicar fora, bloqueia só o parent
-            select_dlg.setWindowModality(Qt.WindowModal)
-            select_dlg.resize(800, 400)  # ← NOVO: Tamanho maior pra não cortar
-            select_layout = QVBoxLayout(select_dlg)
+        preview_dialog = QDialog(self.dialog)
+        preview_dialog.setWindowTitle(
+            "Vectorization and Metrics Filter Preview")
+        preview_dialog.resize(1200, 800)
+        layout = QVBoxLayout()
 
-            # Grupo com checkboxes em grid horizontal (pra não cortar vertical)
-            group_box = QGroupBox("Select files from temp:")
-            # ← FIX: QGridLayout pra disposição horizontal (3 colunas, ajustável)
-            group_layout = QGridLayout(group_box)
-            checkboxes = []
-            num_columns = 3  # Colunas pra wrap horizontal
-            for i, file in enumerate(files_in_temp):
-                chk = QCheckBox(file)
-                chk.setChecked(True)  # Todos selecionados por default
-                row = i // num_columns
-                col = i % num_columns
-                group_layout.addWidget(chk, row, col)
-                checkboxes.append(chk)
+        min_area_slider = QSlider(Qt.Horizontal)
+        min_area_slider.setRange(1, 1000)
+        min_area_slider.setValue(50)
+        min_area_label = QLabel(f"{min_area_slider.value()} px")
+        min_area_slider.valueChanged.connect(
+            lambda val: min_area_label.setText(f"{val} px"))
+        layout.addWidget(QLabel("Minimum polygon area:"))
+        layout.addWidget(min_area_slider)
+        layout.addWidget(min_area_label)
 
-            # Scroll se muitos arquivos
-            scroll_area = QScrollArea()
-            scroll_area.setWidget(group_box)
-            scroll_area.setWidgetResizable(True)
-            select_layout.addWidget(scroll_area)
+        min_compact_slider = QSlider(Qt.Horizontal)
+        min_compact_slider.setRange(1, 100)
+        min_compact_slider.setValue(30)
+        min_compact_label = QLabel(f"{min_compact_slider.value()/100:.2f}")
+        min_compact_slider.valueChanged.connect(
+            lambda val: min_compact_label.setText(f"{val/100:.2f}"))
+        layout.addWidget(QLabel("Minimum compactness (buildings):"))
+        layout.addWidget(min_compact_slider)
+        layout.addWidget(min_compact_label)
 
-            # Botões OK/Cancel
-            btn_layout = QHBoxLayout()
-            ok_btn = QPushButton("Export Selected")
-            cancel_btn = QPushButton("Cancel")
-            btn_layout.addWidget(ok_btn)
-            btn_layout.addWidget(cancel_btn)
-            select_layout.addLayout(btn_layout)
+        ortho_tolerance_slider = QSlider(Qt.Horizontal)
+        ortho_tolerance_slider.setRange(0, 5)
+        ortho_tolerance_slider.setValue(1)
+        ortho_label = QLabel(
+            f"Orthogonalization Tolerance: {ortho_tolerance_slider.value()/2:.1f}")
+        ortho_tolerance_slider.valueChanged.connect(
+            lambda val: ortho_label.setText(f"Orthogonalization Tolerance: {val/2:.1f}"))
+        layout.addWidget(QLabel("Tolerance for Orthogonalization:"))
+        layout.addWidget(QLabel(
+            "Higher value: allows more angular deviation; Lower value: forces stricter orthogonality"))
+        layout.addWidget(ortho_tolerance_slider)
+        layout.addWidget(ortho_label)
 
-            def export_selected():
-                selected_files = [chk.text()
-                                  for chk in checkboxes if chk.isChecked()]
-                if not selected_files:
-                    QMessageBox.warning(
-                        select_dlg, "Warning", "No files selected.")
+        fig_gain, ax_gain = plt.subplots(figsize=(7, 5))
+        canvas_gain = FigureCanvas(fig_gain)
+        layout.addWidget(
+            QLabel("Vectorization Preview Gain (Year 2 - Year 1):"))
+        layout.addWidget(canvas_gain)
+
+        fig_loss, ax_loss = plt.subplots(figsize=(7, 5))
+        canvas_loss = FigureCanvas(fig_loss)
+        layout.addWidget(
+            QLabel("Vectorization Preview Loss (Year 1 - Year 2):"))
+        layout.addWidget(canvas_loss)
+
+        # Throttle updates to avoid heavy repeated processing causing instability
+        if not hasattr(self, '_preview_update_timer'):
+            self._preview_update_timer = QTimer()
+            self._preview_update_timer.setSingleShot(True)
+
+        def _do_update_preview():
+            try:
+                # Defensive checks
+                if 'arr_bin_gain' not in locals() and 'arr_bin_gain' not in globals():
+                    self.log_message('arr_bin_gain missing in preview context')
+                    return
+                if 'arr_bin_loss' not in locals() and 'arr_bin_loss' not in globals():
+                    self.log_message('arr_bin_loss missing in preview context')
                     return
 
-                exported_count = 0
-                for file in selected_files:
-                    src_path = os.path.join(self.temp_dir, file)
-                    dest_path = os.path.join(export_dir, file)
-                    try:
-                        # Copia o arquivo (simples, pra qualquer tipo)
-                        shutil.copy(src_path, dest_path)
-                        self.log_message(f"Exported {file} to {dest_path}")
-                        exported_count += 1
-                    except Exception as copy_e:
-                        self.log_message(
-                            f"Error copying {file}: {str(copy_e)}")
+                # Compute filtered masks based on current slider values
+                try:
+                    labeled_gain, num_gain = ndi.label(arr_bin_gain)
+                except Exception:
+                    labeled_gain = None
+                    num_gain = 0
 
+                filtered_gain = np.zeros_like(arr_bin_gain) if num_gain > 0 else np.zeros((0,))
+                for i in range(1, num_gain + 1):
+                    component = (labeled_gain == i)
+                    coords = np.argwhere(component)
+                    if coords.size == 0:
+                        continue
+                    area = coords.shape[0]
+                    if area < min_area_slider.value():
+                        continue
+                    min_y, min_x = coords.min(0)
+                    max_y, max_x = coords.max(0)
+                    width = max_x - min_x + 1
+                    height = max_y - min_y + 1
+                    perimeter = 2 * (width + height)
+                    compacidade = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
+                    if compacidade < min_compact_slider.value() / 100:
+                        continue
+                    filtered_gain[component] = 1
+
+                ax_gain.clear()
+                if filtered_gain.size != 0:
+                    ax_gain.imshow(filtered_gain, cmap='gray')
+                ax_gain.set_title('Preview Gain Mask', fontsize=10)
+                try:
+                    canvas_gain.draw_idle()
+                except Exception:
+                    canvas_gain.draw()
+
+                try:
+                    labeled_loss, num_loss = ndi.label(arr_bin_loss)
+                except Exception:
+                    labeled_loss = None
+                    num_loss = 0
+
+                filtered_loss = np.zeros_like(arr_bin_loss) if num_loss > 0 else np.zeros((0,))
+                for i in range(1, num_loss + 1):
+                    component = (labeled_loss == i)
+                    coords = np.argwhere(component)
+                    if coords.size == 0:
+                        continue
+                    area = coords.shape[0]
+                    if area < min_area_slider.value():
+                        continue
+                    min_y, min_x = coords.min(0)
+                    max_y, max_x = coords.max(0)
+                    width = max_x - min_x + 1
+                    height = max_y - min_y + 1
+                    perimeter = 2 * (width + height)
+                    compacidade = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
+                    if compacidade < min_compact_slider.value() / 100:
+                        continue
+                    filtered_loss[component] = 1
+
+                ax_loss.clear()
+                if filtered_loss.size != 0:
+                    ax_loss.imshow(filtered_loss, cmap='gray')
+                ax_loss.set_title('Preview Loss Mask', fontsize=10)
+                try:
+                    canvas_loss.draw_idle()
+                except Exception:
+                    canvas_loss.draw()
+
+            except Exception as e:
+                import traceback
+                self.log_message(f"Error in preview update: {e}\n" + traceback.format_exc())
+
+        # internal connect for timer
+        if not self._preview_update_timer.receivers():
+            try:
+                self._preview_update_timer.timeout.connect(_do_update_preview)
+            except Exception:
+                # If connect fails, still allow calling directly
+                pass
+
+        def schedule_preview_update():
+            # start/reset debounce timer (200 ms)
+            try:
+                self._preview_update_timer.start(200)
+            except Exception:
+                # fallback to direct call if timer fails
+                _do_update_preview()
+
+        min_area_slider.valueChanged.connect(lambda v: schedule_preview_update())
+        min_compact_slider.valueChanged.connect(lambda v: schedule_preview_update())
+        # simplify_tolerance_slider.valueChanged.connect
+        ortho_tolerance_slider.valueChanged.connect(lambda v: schedule_preview_update())
+
+        def apply_vectorization():
+            ortho_tol = ortho_tolerance_slider.value() / 2.0
+            min_area = min_area_slider.value()
+            min_compact = min_compact_slider.value() / 100
+
+            # Defensive checks: ensure gain/loss mask paths exist and can be opened
+            if not self.gain_mask_path or not os.path.exists(self.gain_mask_path):
+                QMessageBox.warning(preview_dialog, "Error", "Gain mask not found. Generate masks first.")
+                return
+            if not self.loss_mask_path or not os.path.exists(self.loss_mask_path):
+                QMessageBox.warning(preview_dialog, "Error", "Loss mask not found. Generate masks first.")
+                return
+
+            ds_gain_full = gdal.Open(self.gain_mask_path)
+            ds_loss_full = gdal.Open(self.loss_mask_path)
+            if ds_gain_full is None or ds_loss_full is None:
+                QMessageBox.warning(preview_dialog, "Error", "Failed to open gain/loss mask datasets. Check files and GDAL support.")
+                self.log_message("Failed to open gain/loss mask datasets for vectorization preview")
+                return
+
+            arr_gain_full = ds_gain_full.ReadAsArray()
+            arr_loss_full = ds_loss_full.ReadAsArray()
+            arr_bin_gain_full = (arr_gain_full == 255).astype(np.uint8)
+            arr_bin_loss_full = (arr_loss_full == 255).astype(np.uint8)
+
+            out_gain_path = os.path.join(
+                self.temp_dir, "vector_preview_gain.tif")
+            driver = gdal.GetDriverByName('GTiff')
+            out_ds_gain = driver.Create(
+                out_gain_path, ds_gain_full.RasterXSize, ds_gain_full.RasterYSize, 1, gdal.GDT_Byte)
+            out_ds_gain.SetGeoTransform(ds_gain_full.GetGeoTransform())
+            out_ds_gain.SetProjection(ds_gain_full.GetProjection())
+            labeled_gain, num_gain = ndi.label(arr_bin_gain_full)
+            filtered_gain = np.zeros_like(arr_bin_gain_full)
+            for i in range(1, num_gain + 1):
+                component = (labeled_gain == i)
+                coords = np.argwhere(component)
+                area = coords.shape[0]
+                if area < min_area:
+                    continue
+
+                min_y, min_x = coords.min(0)
+                max_y, max_x = coords.max(0)
+                width = max_x - min_x + 1
+                height = max_y - min_y + 1
+                perimeter = 2 * (width + height)
+                compacidade = 4 * np.pi * area / \
+                    (perimeter ** 2) if perimeter > 0 else 0
+                if compacidade < min_compact:
+                    continue
+
+                filtered_gain[component] = 1
+
+            # Correção Problema 3: Define 0 como NoData para que o polygonize ignore o fundo
+            out_ds_gain.GetRasterBand(1).SetNoDataValue(0)
+            out_ds_gain.GetRasterBand(1).WriteArray(filtered_gain * 255)
+            out_ds_gain = None
+
+            out_loss_path = os.path.join(
+                self.temp_dir, "vector_preview_loss.tif")
+            out_ds_loss = driver.Create(
+                out_loss_path, ds_loss_full.RasterXSize, ds_loss_full.RasterYSize, 1, gdal.GDT_Byte)
+            out_ds_loss.SetGeoTransform(ds_loss_full.GetGeoTransform())
+            out_ds_loss.SetProjection(ds_loss_full.GetProjection())
+            labeled_loss, num_loss = ndi.label(arr_bin_loss_full)
+            filtered_loss = np.zeros_like(arr_bin_loss_full)
+            for i in range(1, num_loss + 1):
+                component = (labeled_loss == i)
+                coords = np.argwhere(component)
+                area = coords.shape[0]
+                if area < min_area:
+                    continue
+                min_y, min_x = coords.min(0)
+                max_y, max_x = coords.max(0)
+                width = max_x - min_x + 1
+                height = max_y - min_y + 1
+
+                perimeter = 2 * (width + height)
+                compacidade = 4 * np.pi * area / \
+                    (perimeter ** 2) if perimeter > 0 else 0
+                if compacidade < min_compact:
+                    continue
+
+                filtered_loss[component] = 1
+
+            # Correção Problema 3: Define 0 como NoData para que o polygonize ignore o fundo
+            out_ds_loss.GetRasterBand(1).SetNoDataValue(0)
+            out_ds_loss.GetRasterBand(1).WriteArray(filtered_loss * 255)
+            out_ds_loss = None
+
+            ds_gain_full = None
+            ds_loss_full = None
+
+            self.gain_vector_path = os.path.join(
+                self.temp_dir, "preview_gain_vector_raw.shp")
+            processing.run("gdal:polygonize", {
+                "INPUT": out_gain_path,
+                "BAND": 1,
+                "FIELD": "val",
+                "OUTPUT": self.gain_vector_path
+            })
+
+            # Post-process raw gain vector: remove background/noise polygons
+            try:
+                # compute raster total area in map units to detect giant background polygons
+                rds = gdal.Open(out_gain_path)
+                gt = rds.GetGeoTransform()
+                px_area = abs(gt[1] * gt[5]) if gt is not None else 1.0
+                total_raster_area = px_area * rds.RasterXSize * rds.RasterYSize
+                rds = None
+
+                raw_gain_layer = QgsVectorLayer(
+                    self.gain_vector_path, "raw_gain", "ogr")
+                if raw_gain_layer.isValid():
+                    clean_gain_path = os.path.join(
+                        self.temp_dir, "preview_gain_vector_raw_clean.shp")
+                    writer = QgsVectorFileWriter(clean_gain_path, 'UTF-8', raw_gain_layer.fields(
+                    ), QgsWkbTypes.Polygon, raw_gain_layer.crs(), 'ESRI Shapefile')
+                    for feat in raw_gain_layer.getFeatures():
+                        try:
+                            gain_field_names = [f.name()
+                                                for f in raw_gain_layer.fields()]
+                            val = feat['val'] if 'val' in gain_field_names else None
+                            if val is None:
+                                continue
+                            # keep only features that represent objects (val == 255)
+                            if int(val) != 255:
+                                continue
+                            geom = feat.geometry()
+                            if geom is None or geom.isEmpty():
+                                continue
+                            area = geom.area()
+                            # discard extremely large polygons (>50% of raster area) as background
+                            # Adiciona um filtro de área mais rigoroso para o polígono de fundo.
+                            # Se a área for maior que 50% da área total do raster, é considerado fundo.
+                            # Isso é crucial para remover o polígono de fundo que pode ter val=255.
+                            if total_raster_area > 0 and area > (total_raster_area * 0.5):
+                                self.log_message(f"Feature {feat.id()} (val={val}) discarded: area ({area}) > 50% of raster area ({total_raster_area * 0.5})")
+                                continue
+                            writer.addFeature(feat)
+                        except Exception:
+                            continue
+                    del writer
+                    # replace gain_vector_path with cleaned version
+                    self.gain_vector_path = clean_gain_path
+            except Exception as e:
                 self.log_message(
-                    f"All selected results ({exported_count}) exported successfully.")
-                QMessageBox.information(
-                    self.dialog, "Success", f"Selected files exported to {export_dir}")
-                select_dlg.accept()
+                    f"Warning: failed to clean gain raw vector: {e}")
 
-            ok_btn.clicked.connect(export_selected)
-            cancel_btn.clicked.connect(select_dlg.reject)
+            # Definir caminhos finais para os vetores ortogonalizados
+            self.ortho_gain_path = os.path.join(
+                self.temp_dir, "preview_gain_vector_ortho.shp")
+            self.ortho_loss_path = os.path.join(
+                self.temp_dir, "preview_loss_vector_ortho.shp")
 
-            select_dlg.exec_()  # Modal exec pra ficar aberto até OK/Cancel
+            # Ortho para GAIN
+            self._orthogonalize_vector(
+                self.gain_vector_path, self.ortho_gain_path, ortho_tol
+            )
+            self._load_vector_to_project(
+                self.ortho_gain_path, "Preview Gain Vector (Ortho)"
+            )
 
-        except Exception as e:
-            self.log_message(f"Error exporting all results: {str(e)}")
-            QMessageBox.warning(self.dialog, "Error",
-                                f"Error exporting all results: {str(e)}")
+            # Criar RAW para LOSS
+            loss_vector_raw = os.path.join(
+                self.temp_dir, "preview_loss_vector_raw.shp")
+            processing.run("gdal:polygonize", {
+                "INPUT": out_loss_path,
+                "BAND": 1,
+                "FIELD": "val",
+                "OUTPUT": loss_vector_raw
+            })
+
+            # Post-process raw loss vector: remove background/noise polygons
+            try:
+                rds = gdal.Open(out_loss_path)
+                gt = rds.GetGeoTransform()
+                px_area = abs(gt[1] * gt[5]) if gt is not None else 1.0
+                total_raster_area = px_area * rds.RasterXSize * rds.RasterYSize
+                rds = None
+
+                raw_loss_layer = QgsVectorLayer(
+                    loss_vector_raw, "raw_loss", "ogr")
+                if raw_loss_layer.isValid():
+                    clean_loss_path = os.path.join(
+                        self.temp_dir, "preview_loss_vector_raw_clean.shp")
+                    writer_l = QgsVectorFileWriter(clean_loss_path, 'UTF-8', raw_loss_layer.fields(
+                    ), QgsWkbTypes.Polygon, raw_loss_layer.crs(), 'ESRI Shapefile')
+                    for feat in raw_loss_layer.getFeatures():
+                        try:
+                            loss_field_names = [f.name()
+                                                for f in raw_loss_layer.fields()]
+                            val = feat['val'] if 'val' in loss_field_names else None
+                            if val is None:
+                                continue
+                            # keep only features that represent objects (val == 255)
+                            if int(val) != 255:
+                                continue
+                            geom = feat.geometry()
+                            if geom is None or geom.isEmpty():
+                                continue
+                            area = geom.area()
+                            # Adiciona um filtro de área mais rigoroso para o polígono de fundo.
+                            # Se a área for maior que 50% da área total do raster, é considerado fundo.
+                            # Isso é crucial para remover o polígono de fundo que pode ter val=255.
+                            if total_raster_area > 0 and area > (total_raster_area * 0.5):
+                                self.log_message(f"Feature {feat.id()} (val={val}) discarded: area ({area}) > 50% of raster area ({total_raster_area * 0.5})")
+                                continue
+                            writer_l.addFeature(feat)
+                        except Exception:
+                            continue
+                    del writer_l
+                    loss_vector_raw = clean_loss_path
+            except Exception as e:
+                self.log_message(
+                    f"Warning: failed to clean loss raw vector: {e}")
+
+            # Ortho para LOSS
+            self._orthogonalize_vector(
+                loss_vector_raw, self.ortho_loss_path, ortho_tol
+            )
+            self._load_vector_to_project(
+                self.ortho_loss_path, "Preview Loss Vector (Ortho)"
+            )
+
+            QMessageBox.information(
+                self.dialog, "Success", "Vectorization with filters and orthogonalization applied and loaded in the project."
+            )
+            preview_dialog.accept()
+
+        apply_button = QPushButton("Apply Vectorization and Orthogonalization")
+        apply_button.clicked.connect(apply_vectorization)
+        layout.addWidget(apply_button)
+
+        preview_dialog.setLayout(layout)
+        update_preview()
+        preview_dialog.exec_()
+
+    def _orthogonalize_vector(self, input_path, output_path, ortho_tol):
+        layer = QgsVectorLayer(input_path, "temp", "ogr")
+        fields = layer.fields()
+        writer = QgsVectorFileWriter(
+            output_path, 'UTF-8', fields, QgsWkbTypes.Polygon, layer.crs(), 'ESRI Shapefile')
+        for feat in layer.getFeatures():
+            geom = feat.geometry()
+            if not geom or geom.isEmpty():
+                continue
+            orthogonal = geom.densifyByCount(5).orthogonalize(
+                ortho_tol) if hasattr(geom, 'orthogonalize') else geom
+            feat.setGeometry(orthogonal)
+            writer.addFeature(feat)
+        del writer
+
+        self._load_vector_to_project(self.gain_vector_path, "Gain Vectors")
+        self._load_vector_to_project(self.loss_vector_path, "Loss Vectors")
+
+        # agora sim os combos podem ser atualizados
+        # self.populate_vector_combos()
+
+    # Duplicate legacy implementation removed. Use the updated
+    # `generate_centroids` implementation above which detects project-loaded
+    # file:// URIs, temp files and presents a selection dialog to the user.
+
+
