@@ -21,7 +21,7 @@
 name=Urban Change AID
 qgisMinimumVersion=3.40.0
 description=QGIS plugin for detecting and analyzing urban changes between two time periods using satellite or aerial imagery and AI-assisted metrics.
-version=1.1
+version=1.1.2
 author=Leandro da Silva Gregorio
 email=leandrogeosmart@gmail.com
 about=Urban Change AID provides an integrated workflow for detecting, mapping, and analyzing urban changes across two dates. It includes tools for image alignment, spectral band extraction, normalization, thresholding, difference calculation, mask generation, vectorization, and spatial metrics computation. Designed for satellite or aerial imagery, the plugin features an intuitive tabbed interface that guides the user through each stage of the process.
