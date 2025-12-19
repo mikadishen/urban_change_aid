@@ -547,10 +547,41 @@ class UrbanChangeAid:
             # Configurações iniciais dos spinbox
             self.dialog.spinCropWidth.setMaximum(99999)
             self.dialog.spinCropHeight.setMaximum(99999)
+            
+            # --- Ajuste para 16 bits na Binarização ---
+            # A detecção do max_val deve ser feita aqui para definir o range dos spinboxes de threshold.
+            # Como o self.band_yearX_path ainda não está definido, vamos usar uma função para obter o max_val
+            # ou, se não for possível, usar 65535 como fallback para o range máximo.
+            
+            max_val_binarization = 255 # Default para 8 bits
+            
+            # Tenta detectar o max_val da imagem normalizada (se já existir)
+            if self.norm_year1_path and os.path.exists(self.norm_year1_path):
+                try:
+                    ds1 = gdal.Open(self.band_year1_path)
+                    band1 = ds1.GetRasterBand(1).ReadAsArray()
+                    max_val_binarization = int(np.nanmax(band1))
+                    ds1 = None
+                except Exception:
+                    max_val_binarization = 65535 # Fallback se a leitura falhar, assume 16 bits
+            elif self.band_year1_path and os.path.exists(self.band_year1_path):
+                # Se a normalizada não existe, tenta a banda original
+                try:
+                    ds1 = gdal.Open(self.band_year1_path)
+                    band1 = ds1.GetRasterBand(1).ReadAsArray()
+                    max_val_binarization = int(np.nanmax(band1))
+                    ds1 = None
+                except Exception:
+                    max_val_binarization = 65535 # Fallback se a leitura falhar, assume 16 bits
+            
+            # Garante que o range seja 65535 se o valor detectado for maior que 255
+            slider_max_binarization = 9999999 # Ajustado para permitir 7 caracteres numéricos (até 65535 e mais)
+            
             if hasattr(self.dialog, 'spinThresholdYear1'):
-                self.dialog.spinThresholdYear1.setMaximum(255)
+                self.dialog.spinThresholdYear1.setMaximum(slider_max_binarization)
             if hasattr(self.dialog, 'spinThresholdYear2'):
-                self.dialog.spinThresholdYear2.setMaximum(255)
+                self.dialog.spinThresholdYear2.setMaximum(slider_max_binarization)
+            # --- Fim do Ajuste para 16 bits na Binarização ---
 
             # Conecta sinais
             self.connect_signals()
@@ -630,8 +661,8 @@ class UrbanChangeAid:
         param_layout.addWidget(
             QLabel("Iterações de Suavização (Chaikin):"), 0, 0)
         param_layout.addWidget(smooth_iterations_spin, 0, 1)
-        param_layout.addWidget(
-            QLabel("Comprimento do Segmento (Unidades de Mapa):"), 1, 0)
+
+        param_layout.addWidget(QLabel("Comprimento do Segmento (Unidades de Mapa):"), 1, 0)
         param_layout.addWidget(segment_length_spin, 1, 1)
         param_layout.addWidget(preserve_area_check, 2, 0, 1, 2)
         param_layout.addWidget(QLabel("Tolerância de Área (%):"), 3, 0)
@@ -1290,23 +1321,15 @@ class UrbanChangeAid:
             # Remove previous preview for this label
             _remove_preview(label)
 
-            # Load output into project and track it so plugin can remove later
+            # Load output into project and notify
             layer = QgsVectorLayer(out_path, f"{label} Processed", "ogr")
             if not layer.isValid():
                 QMessageBox.warning(
                     dlg, "Load Error", "Failed to load processed layer into project.")
                 return
             QgsProject.instance().addMapLayer(layer)
-            self.loaded_layer_ids.append(layer.id())
-
-            # Update the path for the next steps
-            if label == "Gain Vectors (with Metrics)":
-                self.filtered_gain_vector = out_path
-            elif label == "Loss Vectors (with Metrics)":
-                self.filtered_loss_vector = out_path
-
-            QMessageBox.information(
-                dlg, "Success", f"Processed layer added to project: {layer.name()}")
+            self.log_message(f"✅ Processed layer added: {layer.name()}")
+            QMessageBox.information(dlg, "Success", f"Processed layer added to project: {layer.name()}")
 
         def do_next():
             # enable next tab and advance one step (non-mandatory)
@@ -1866,7 +1889,87 @@ class UrbanChangeAid:
                 if ex_layer.id() in self.loaded_layer_ids:
                     self.loaded_layer_ids.remove(ex_layer.id())
 
+        # Adiciona a camada ao projeto
         QgsProject.instance().addMapLayer(layer)
+
+        # Configura o renderer para máscaras binárias (Gain/Loss)
+        if "Binarized" in name or "Mask" in name:
+            try:
+                # Create discrete color ramp: 0 -> transparent (background), 255 -> color
+                if "Gain" in name:
+                    clr0 = QColor(0, 0, 0, 0)
+                    clr1 = QColor(255, 0, 0, 255)
+                elif "Loss" in name:
+                    clr0 = QColor(0, 0, 0, 0)
+                    clr1 = QColor(0, 0, 255, 255)
+                else:
+                    clr0 = QColor(0, 0, 0, 0)
+                    clr1 = QColor(255, 255, 255, 255)
+
+                color_items = [
+                    QgsColorRampShader.ColorRampItem(0, clr0, '0'),
+                    QgsColorRampShader.ColorRampItem(255, clr1, '255')
+                ]
+                color_ramp = QgsColorRampShader()
+                color_ramp.setColorRampItemList(color_items)
+                color_ramp.setColorRampType(QgsColorRampShader.Discrete)
+
+                raster_shader = QgsRasterShader()
+                raster_shader.setRasterShaderFunction(color_ramp)
+
+                renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, raster_shader)
+
+                # Force contrast range
+                try:
+                    ce = renderer.contrastEnhancement()
+                    if ce is not None:
+                        ce.setMinimumValue(0)
+                        ce.setMaximumValue(255)
+                except Exception:
+                    pass
+
+                layer.setRenderer(renderer)
+                layer.triggerRepaint()
+
+                # Try setting raster transparency (fallbacks for different QGIS APIs)
+                try:
+                    from qgis.core import QgsRasterTransparency
+                    try:
+                        entry = QgsRasterTransparency.TransparentSingleValuePixel(0, 0)
+                        trans = QgsRasterTransparency()
+                        trans.setTransparentSingleValuePixelList([entry])
+                        renderer.setRasterTransparency(trans)
+                        layer.triggerRepaint()
+                        self.log_message(f"Applied pseudo-color renderer and transparency for {name}")
+                    except Exception:
+                        # alternate API
+                        trans = QgsRasterTransparency()
+                        entry = QgsRasterTransparency.TransparentSingleValuePixel()
+                        entry.setValue(0)
+                        entry.setOpacity(0)
+                        trans.setTransparentSingleValuePixelList([entry])
+                        renderer.setRasterTransparency(trans)
+                        layer.triggerRepaint()
+                        self.log_message(f"Applied transparency fallback for {name}")
+                except Exception as e:
+                    self.log_message(f"Could not apply raster transparency for {name}: {e}")
+
+            except Exception as e:
+                # Fallback: simple gray renderer with contrast enhancement
+                try:
+                    renderer = QgsSingleBandGrayRenderer(layer.dataProvider(), 1)
+                    try:
+                        ce = renderer.contrastEnhancement()
+                        if ce is not None:
+                            ce.setMinimumValue(0)
+                            ce.setMaximumValue(255)
+                    except Exception:
+                        pass
+                    layer.setRenderer(renderer)
+                    layer.triggerRepaint()
+                    self.log_message(f"Applied gray fallback renderer for {name}")
+                except Exception as e2:
+                    self.log_message(f"Failed to set renderer for {name}: {e} / {e2}")
         self.loaded_layer_ids.append(layer.id())
 
         if "Year 1" in name:
@@ -2008,15 +2111,29 @@ class UrbanChangeAid:
             except Exception:
                 pass
             layout.addWidget(canvas)
+            # 1. Carrega as bandas
+            ds1 = gdal.Open(self.band_year1_path)
+            ds2 = gdal.Open(self.band_year2_path)
+            band1 = ds1.GetRasterBand(1).ReadAsArray()
+            band2 = ds2.GetRasterBand(1).ReadAsArray()
+
+            # 2. Detecta o valor máximo da banda para definir o range do slider
+            max_val = int(max(np.nanmax(band1) if not np.all(np.isnan(band1)) else 0,
+                              np.nanmax(band2) if not np.all(np.isnan(band2)) else 0))
+            
+            # Se o valor máximo for maior que 255, usa 65535 como limite superior para o slider
+            # Caso contrário, usa 255.
+            slider_max = 65535 if max_val > 255 else 255
+            self.log_message(f"Detected max band value: {max_val}. Setting slider max to: {slider_max}")
 
             # Min Year 1 - Label, Slider e SpinBox
             min1_label = QLabel("Min Year 1:")
             min1_slider = QSlider(Qt.Horizontal)
-            min1_slider.setRange(0, 255)
+            min1_slider.setRange(0, slider_max)
             min1_slider.setValue(int(np.nanmin(band1))
                                  if not np.all(np.isnan(band1)) else 0)
             min1_spinbox = QSpinBox()
-            min1_spinbox.setRange(0, 255)
+            min1_spinbox.setRange(0, slider_max)
             min1_spinbox.setValue(min1_slider.value())
 
             # Sincronização bidirecional
@@ -2034,11 +2151,11 @@ class UrbanChangeAid:
             # Max Year 1 - Label, Slider e SpinBox
             max1_label = QLabel("Max Year 1:")
             max1_slider = QSlider(Qt.Horizontal)
-            max1_slider.setRange(0, 255)
+            max1_slider.setRange(0, slider_max)
             max1_slider.setValue(int(np.nanmax(band1))
-                                 if not np.all(np.isnan(band1)) else 255)
+                                 if not np.all(np.isnan(band1)) else slider_max)
             max1_spinbox = QSpinBox()
-            max1_spinbox.setRange(0, 255)
+            max1_spinbox.setRange(0, slider_max)
             max1_spinbox.setValue(max1_slider.value())
 
             # Sincronização bidirecional
@@ -2056,11 +2173,11 @@ class UrbanChangeAid:
             # Min Year 2 - Label, Slider e SpinBox
             min2_label = QLabel("Min Year 2:")
             min2_slider = QSlider(Qt.Horizontal)
-            min2_slider.setRange(0, 255)
+            min2_slider.setRange(0, slider_max)
             min2_slider.setValue(int(np.nanmin(band2))
                                  if not np.all(np.isnan(band2)) else 0)
             min2_spinbox = QSpinBox()
-            min2_spinbox.setRange(0, 255)
+            min2_spinbox.setRange(0, slider_max)
             min2_spinbox.setValue(min2_slider.value())
 
             # Sincronização bidirecional
@@ -2078,11 +2195,11 @@ class UrbanChangeAid:
             # Max Year 2 - Label, Slider e SpinBox
             max2_label = QLabel("Max Year 2:")
             max2_slider = QSlider(Qt.Horizontal)
-            max2_slider.setRange(0, 255)
+            max2_slider.setRange(0, slider_max)
             max2_slider.setValue(int(np.nanmax(band2))
-                                 if not np.all(np.isnan(band2)) else 255)
+                                 if not np.all(np.isnan(band2)) else slider_max)
             max2_spinbox = QSpinBox()
-            max2_spinbox.setRange(0, 255)
+            max2_spinbox.setRange(0, slider_max)
             max2_spinbox.setValue(max2_slider.value())
 
             # Sincronização bidirecional
@@ -2228,9 +2345,9 @@ class UrbanChangeAid:
 
     def binarize(self):
         """Binarize the normalized images based on threshold values."""
-        if not self.norm_year1_path or not self.norm_year2_path:
+        if not self.band_year1_path or not self.band_year2_path:
             QMessageBox.warning(self.dialog, "Warning",
-                                "Please normalize contrast first.")
+                                "Please extract bands first.")
             return
         try:
             output_dir = os.path.join(self.temp_dir, "binarized_images")
@@ -2238,11 +2355,13 @@ class UrbanChangeAid:
             self.bin_year1_path = os.path.join(output_dir, "bin_year1.tif")
             self.bin_year2_path = os.path.join(output_dir, "bin_year2.tif")
 
-            ds1 = gdal.Open(self.norm_year1_path)
+            ds1 = gdal.Open(self.band_year1_path)
             if ds1 is None:
                 raise Exception(
-                    f"Failed to open normalized image for Year 1: {self.norm_year1_path}")
+                    f"Failed to open band image for Year 1: {self.band_year1_path}")
             data1 = ds1.ReadAsArray()
+            threshold1 = self.dialog.spinThresholdYear1.value()
+            self.log_message(f"Binarize Year 1: Threshold={threshold1}, Max Data={np.nanmax(data1)}")
             bin_data1 = (data1 > self.dialog.spinThresholdYear1.value()).astype(
                 np.uint8) * 255
             driver = gdal.GetDriverByName('GTiff')
@@ -2254,11 +2373,13 @@ class UrbanChangeAid:
             out_ds1 = None
             ds1 = None
 
-            ds2 = gdal.Open(self.norm_year2_path)
+            ds2 = gdal.Open(self.band_year2_path)
             if ds2 is None:
                 raise Exception(
-                    f"Failed to open normalized image for Year 2: {self.norm_year2_path}")
+                    f"Failed to open band image for Year 2: {self.band_year2_path}")
             data2 = ds2.ReadAsArray()
+            threshold2 = self.dialog.spinThresholdYear2.value()
+            self.log_message(f"Binarize Year 2: Threshold={threshold2}, Max Data={np.nanmax(data2)}")
             bin_data2 = (data2 > self.dialog.spinThresholdYear2.value()).astype(
                 np.uint8) * 255
             out_ds2 = driver.Create(
@@ -2269,14 +2390,39 @@ class UrbanChangeAid:
             out_ds2 = None
             ds2 = None
 
-            if os.path.exists(self.bin_year1_path) and QgsRasterLayer(self.bin_year1_path, "").isValid():
-                self._load_to_project(
-                    self.bin_year1_path, "Binarized - Year 1")
+            import traceback
+
+            # Diagnostics for Year 1
+            exists1 = os.path.exists(self.bin_year1_path)
+            valid1 = False
+            try:
+                valid1 = QgsRasterLayer(self.bin_year1_path, "").isValid()
+            except Exception:
+                valid1 = False
+            self.log_message(f"Diagnostics Year1 - path_exists={exists1}, qgs_valid={valid1}")
+            if exists1 and valid1:
+                try:
+                    self._load_to_project(self.bin_year1_path, "Binarized - Year 1")
+                except Exception as e:
+                    QgsMessageLog.logMessage(f"Error loading Binarized - Year 1: {e}\n{traceback.format_exc()}", 'UrbanChangeAid', Qgis.Warning)
+                    raise
             else:
                 raise Exception("Failed to create binarized image for Year 1.")
-            if os.path.exists(self.bin_year2_path) and QgsRasterLayer(self.bin_year2_path, "").isValid():
-                self._load_to_project(
-                    self.bin_year2_path, "Binarized - Year 2")
+
+            # Diagnostics for Year 2
+            exists2 = os.path.exists(self.bin_year2_path)
+            valid2 = False
+            try:
+                valid2 = QgsRasterLayer(self.bin_year2_path, "").isValid()
+            except Exception:
+                valid2 = False
+            self.log_message(f"Diagnostics Year2 - path_exists={exists2}, qgs_valid={valid2}")
+            if exists2 and valid2:
+                try:
+                    self._load_to_project(self.bin_year2_path, "Binarized - Year 2")
+                except Exception as e:
+                    QgsMessageLog.logMessage(f"Error loading Binarized - Year 2: {e}\n{traceback.format_exc()}", 'UrbanChangeAid', Qgis.Warning)
+                    raise
             else:
                 raise Exception("Failed to create binarized image for Year 2.")
             QMessageBox.information(
@@ -2554,9 +2700,18 @@ class UrbanChangeAid:
         layout = QVBoxLayout(dialog)
 
         # Gain threshold
+        # Detecta o valor máximo da imagem de diferença
+        diff_ds = gdal.Open(self.difference_path)
+        diff_band = diff_ds.GetRasterBand(1).ReadAsArray()
+        max_abs_val = np.nanmax(np.abs(diff_band))
+        diff_ds = None
+        
+        # Define o range máximo para o spinbox (255.0 ou 65535.0)
+        max_range = 65535.0 if max_abs_val > 255.0 else 255.0
+        
         thresh_gain_spin = QDoubleSpinBox()
         thresh_gain_spin.setDecimals(2)
-        thresh_gain_spin.setRange(-255.0, 255.0)
+        thresh_gain_spin.setRange(-max_range, max_range)
         thresh_gain_spin.setSingleStep(0.10)
         thresh_gain_spin.setValue(0.10)
         layout.addWidget(QLabel("Gain Threshold:"))
@@ -2565,7 +2720,7 @@ class UrbanChangeAid:
         # Loss threshold
         thresh_loss_spin = QDoubleSpinBox()
         thresh_loss_spin.setDecimals(2)
-        thresh_loss_spin.setRange(-255.0, 255.0)
+        thresh_loss_spin.setRange(-max_range, max_range)
         thresh_loss_spin.setSingleStep(0.10)
         thresh_loss_spin.setValue(-0.10)
         layout.addWidget(QLabel("Loss Threshold:"))
@@ -2629,18 +2784,100 @@ class UrbanChangeAid:
             proj = ds.GetProjection()
             ds = None
 
-            # Generate masks
-            # Gain: pixels with values GREATER THAN OR EQUAL TO the gain threshold are considered gain (255 = white)
-            gain = np.where(diff >= thresh_gain, 255, 0).astype(np.uint8)
-            # Loss: pixels with values LESS THAN OR EQUAL TO the loss threshold are considered loss (255 = white)
-            loss = np.where(diff <= thresh_loss, 255, 0).astype(np.uint8)
+            # Diagnostics
+            try:
+                finite_mask = np.isfinite(diff)
+                total_pixels = diff.size
+                finite_pixels = np.count_nonzero(finite_mask)
+                minv = float(np.nanmin(diff)) if finite_pixels > 0 else float('nan')
+                maxv = float(np.nanmax(diff)) if finite_pixels > 0 else float('nan')
+                pct_finite = finite_pixels / total_pixels * 100.0 if total_pixels > 0 else 0.0
+            except Exception:
+                minv = float('nan')
+                maxv = float('nan')
+                pct_finite = 0.0
+            self.log_message(f"Difference stats: min={minv}, max={maxv}, finite%={pct_finite:.2f}%, shape={diff.shape}")
 
+            # If thresholds are inconsistent (e.g., user swapped gain/loss), fix by swapping
+            try:
+                if thresh_gain <= thresh_loss:
+                    self.log_message(f"Warning: gain threshold ({thresh_gain}) <= loss threshold ({thresh_loss}). Swapping values.")
+                    thresh_gain, thresh_loss = thresh_loss, thresh_gain
+            except Exception:
+                pass
+
+            # Count how many pixels meet thresholds (for debugging when masks are all white/black)
+            try:
+                count_gain = int(np.count_nonzero((diff >= thresh_gain) & finite_mask))
+                count_loss = int(np.count_nonzero((diff <= thresh_loss) & finite_mask))
+            except Exception:
+                count_gain = 0
+                count_loss = 0
+            self.log_message(f"Pixels >= gain({thresh_gain}): {count_gain} / {total_pixels}")
+            self.log_message(f"Pixels <= loss({thresh_loss}): {count_loss} / {total_pixels}")
+
+            # Generate masks robustly using finite mask
+            gain = np.zeros_like(diff, dtype=np.uint8)
+            loss = np.zeros_like(diff, dtype=np.uint8)
+            if finite_pixels > 0:
+                gain[np.where((diff >= thresh_gain) & finite_mask)] = 255
+                loss[np.where((diff <= thresh_loss) & finite_mask)] = 255
+
+            # Diagnostic outputs: save normalized diff and histogram for inspection
+            try:
+                # Ensure GDAL driver is available for debug writes
+                driver = gdal.GetDriverByName('GTiff')
+                debug_dir = output_dir
+                diff_debug_path = os.path.join(debug_dir, "diff_debug.tif")
+                hist_path = os.path.join(debug_dir, "diff_hist.png")
+                # normalize diff to 0-255 for visualization (finite only)
+                norm = np.zeros_like(diff, dtype=np.uint8)
+                if np.isfinite(minv) and np.isfinite(maxv) and not np.isclose(minv, maxv):
+                    scaled = (diff - minv) / (maxv - minv)
+                    scaled[~finite_mask] = 0.0
+                    norm = np.clip((scaled * 255.0), 0, 255).astype(np.uint8)
+                else:
+                    # fallback: cast finite values to 255
+                    norm[finite_mask] = 255
+
+                try:
+                    dbg_ds = driver.Create(diff_debug_path, norm.shape[1], norm.shape[0], 1, gdal.GDT_Byte)
+                    dbg_ds.SetGeoTransform(geo)
+                    dbg_ds.SetProjection(proj)
+                    dbg_ds.GetRasterBand(1).WriteArray(norm)
+                    dbg_ds.FlushCache()
+                    dbg_ds = None
+                    self.log_message(f"Wrote diagnostic diff image: {diff_debug_path}")
+                except Exception as e:
+                    self.log_message(f"Failed to write diff_debug.tif: {e}")
+
+                # save histogram of finite diff values
+                try:
+                    vals = diff[finite_mask]
+                    if vals.size > 0:
+                        plt.figure(figsize=(6, 4))
+                        plt.hist(vals.flatten(), bins=256)
+                        plt.title('Difference Histogram')
+                        plt.tight_layout()
+                        plt.savefig(hist_path)
+                        plt.close()
+                        self.log_message(f"Wrote diagnostic histogram: {hist_path}")
+                except Exception as e:
+                    self.log_message(f"Failed to write histogram: {e}")
+            except Exception:
+                pass
+
+            # Ensure driver is available for subsequent raster writes
             driver = gdal.GetDriverByName('GTiff')
             out_g = driver.Create(
                 self.gain_mask_path, gain.shape[1], gain.shape[0], 1, gdal.GDT_Byte)
             out_g.SetGeoTransform(geo)
             out_g.SetProjection(proj)
             out_g.GetRasterBand(1).WriteArray(gain)
+            try:
+                out_g.GetRasterBand(1).SetNoDataValue(0)
+            except Exception:
+                pass
             out_g.FlushCache()
             out_g = None
 
@@ -2649,6 +2886,10 @@ class UrbanChangeAid:
             out_l.SetGeoTransform(geo)
             out_l.SetProjection(proj)
             out_l.GetRasterBand(1).WriteArray(loss)
+            try:
+                out_l.GetRasterBand(1).SetNoDataValue(0)
+            except Exception:
+                pass
             out_l.FlushCache()
             out_l = None
 
@@ -2842,7 +3083,40 @@ class UrbanChangeAid:
                 self.loaded_layer_ids.remove(ex_layer.id())
 
         # Add the new layer
+        # Adiciona a camada ao projeto
         QgsProject.instance().addMapLayer(layer)
+
+        # Configura o renderer para máscaras binárias (Gain/Loss)
+        if "Binarized" in name or "Mask" in name:
+            # Cria um renderer de banda única cinza com range 0-255
+            renderer = QgsSingleBandGrayRenderer(layer.dataProvider(), 1)
+            # Define o range de visualização fixo para 0 a 255
+
+            ce = None
+            try:
+                ce = renderer.contrastEnhancement()
+            except Exception:
+                ce = None
+            if ce is None:
+                try:
+                    from qgis.core import QgsContrastEnhancement
+
+                    ce = QgsContrastEnhancement()
+                    if hasattr(renderer, 'setContrastEnhancement'):
+                        try:
+                            renderer.setContrastEnhancement(ce)
+                        except Exception:
+                            pass
+                except Exception:
+                    ce = None
+            if ce is not None:
+                try:
+                    ce.setMinimumValue(0)
+                    ce.setMaximumValue(255)
+                except Exception:
+                    pass
+            layer.setRenderer(renderer)
+            layer.triggerRepaint()
         self.loaded_layer_ids.append(layer.id())
         self.log_message(f"Vector layer loaded: {name}")
         return layer
@@ -2957,6 +3231,10 @@ class UrbanChangeAid:
                 self.log_message(
                     f"Added fields to {layer.name()}: {', '.join([f.name() for f in needed])}")
 
+            # Garante que o diretório temporário exista e tenta exportar os vetores filtrados
+            # para que o processamento subsequente possa usá-los.
+            self._ensure_temp_dir()
+            self._export_filtered_vectors_to_temp_fixed()
             layer = self.compute_metrics_on_layer(layer, layer.name())
 
         # Adiciona ao projeto após processamento
@@ -3160,23 +3438,39 @@ class UrbanChangeAid:
         if not layer or not layer.isValid():
             raise Exception(f"Invalid layer: {layer_name}")
 
+        # O _ensure_temp_dir e a exportação para temp_dir são chamados em next_to_metrics.
+        # Não é necessário garantir o diretório aqui.
+
         # Corrige geometrias e converte para singlepart (mantém)
         fixed_path = os.path.join(
             self.temp_dir, f"fixed_{layer_name.lower().replace(' ', '_')}.shp")
-        processing.run("qgis:fixgeometries", {
-                       'INPUT': layer, 'OUTPUT': fixed_path})
+        try:
+            processing.run("qgis:fixgeometries", {'INPUT': layer, 'OUTPUT': fixed_path})
+        except Exception as e:
+            self.log_message(f"Processing error running fixgeometries for {layer_name}: {e}")
+            raise Exception(f"Failed to run fixgeometries for {layer_name}: {e}")
+
+        if not os.path.exists(fixed_path):
+            raise Exception(f"fixgeometries did not produce output file: {fixed_path}. Check temp dir and permissions.")
+
         fixed_layer = QgsVectorLayer(fixed_path, "Fixed Layer", "ogr")
         if not fixed_layer.isValid():
-            raise Exception(f"Failed to fix geometries for {layer_name}")
+            raise Exception(f"Fixed geometries output invalid for {layer_name}: {fixed_path}. Check drivers and file integrity.")
 
         single_path = os.path.join(
             self.temp_dir, f"single_{layer_name.lower().replace(' ', '_')}.shp")
-        processing.run("qgis:multiparttosingleparts", {
-                       'INPUT': fixed_layer, 'OUTPUT': single_path})
+        try:
+            processing.run("qgis:multiparttosingleparts", {'INPUT': fixed_layer, 'OUTPUT': single_path})
+        except Exception as e:
+            self.log_message(f"Processing error running multiparttosingleparts for {layer_name}: {e}")
+            raise Exception(f"Failed to run multiparttosingleparts for {layer_name}: {e}")
+
+        if not os.path.exists(single_path):
+            raise Exception(f"multiparttosingleparts did not produce output file: {single_path}. Check temp dir and permissions.")
+
         layer = QgsVectorLayer(single_path, layer_name, "ogr")
         if not layer.isValid():
-            raise Exception(
-                f"Failed to convert to singlepart for {layer_name}")
+            raise Exception(f"Singlepart output invalid for {layer_name}: {single_path}. Check drivers and file integrity.")
 
         self.log_message(
             f"Geometries fixed and converted to singlepart for {layer_name}")
@@ -3339,7 +3633,7 @@ class UrbanChangeAid:
             min_rect = self.dialog.spinRectangularity.value() if hasattr(
                 self.dialog, 'spinRectangularity') else self.dialog.sliderRectangularity.value() / 100.0
 
-            # Substitua as linhas problemáticas por este bloco seguro:
+            # Atualiza labels informativos (se existirem)
             if hasattr(self.dialog, 'labelMinArea'):
                 self.dialog.labelMinArea.setText(
                     f"Min area: {self.dialog.sliderArea.value():,}")
@@ -3365,39 +3659,80 @@ class UrbanChangeAid:
             gain_layers = QgsProject.instance().mapLayersByName("Gain Vectors (with Metrics)")
             loss_layers = QgsProject.instance().mapLayersByName("Loss Vectors (with Metrics)")
 
+            if not gain_layers and not loss_layers:
+                self.log_message("No metric layers found to filter.")
+                QMessageBox.warning(self.dialog, "Warning",
+                                    "No metric layers available (Gain/Loss). Run 'Calculate Metrics and Filter' first.")
+                return
+
+            def _total_features_safe(layer):
+                try:
+                    cnt = layer.featureCount()
+                    if cnt is None or cnt < 0:
+                        # Some providers return -1/-2 for unknown counts; iterate instead
+                        cnt = sum(1 for _ in layer.getFeatures())
+                    return cnt
+                except Exception:
+                    try:
+                        return sum(1 for _ in layer.getFeatures())
+                    except Exception:
+                        return 0
+
             # Para Gain
             if gain_layers and len(gain_layers) > 0:
                 gain_layer = gain_layers[0]
-                expression = expression_base + ' AND "val" = 255'
-                gain_layer.removeSelection()
-                gain_layer.selectByExpression(expression)
-                self.log_message(
-                    f"Test expression: {expression} — Expecting ~{gain_layer.featureCount() / 2} features")
-                after_select = gain_layer.selectedFeatureCount()
-                self.log_message(f"Selected: {after_select} features")
-                if after_select == 0:
-                    # Fallback: selecione só válidas
-                    gain_layer.selectByExpression(
-                        '"is_valid" = 1 AND "val" = 255')
-                    self.log_message("Fallback: All valid selected")
-                self.iface.layerTreeView().refreshLayerSymbology(gain_layer.id())
+                if not gain_layer or not gain_layer.isValid():
+                    self.log_message("⚠️ Gain layer is invalid or could not be loaded.")
+                else:
+                    total = _total_features_safe(gain_layer)
+                    self.log_message(f"📊 Layer diagnostics: Total features = {total}")
+                    if total == 0:
+                        self.log_message("⚠️ Gain layer has no features - skipping gain filter.")
+                    else:
+                        expression = expression_base + ' AND "val" = 255'
+                        gain_layer.removeSelection()
+                        gain_layer.selectByExpression(expression)
+                        self.log_message(
+                            f"Test expression: {expression} — Applied")
+                        after_select = gain_layer.selectedFeatureCount()
+                        self.log_message(f"Selected: {after_select} features")
+                        if after_select == 0:
+                            # Fallback: selecione só válidas
+                            gain_layer.selectByExpression(
+                                '"is_valid" = 1 AND "val" = 255')
+                            self.log_message("Fallback: All valid selected")
+                        try:
+                            self.iface.layerTreeView().refreshLayerSymbology(gain_layer.id())
+                        except Exception:
+                            pass
 
             # Para Loss (repete o padrão)
             if loss_layers and len(loss_layers) > 0:
                 loss_layer = loss_layers[0]
-                expression = expression_base + ' AND "val" = 255'
-                loss_layer.removeSelection()
-                loss_layer.selectByExpression(expression)
-                self.log_message(
-                    f"Test expression: {expression} — Expecting ~{loss_layer.featureCount() / 2} features")
-                after_select = loss_layer.selectedFeatureCount()
-                self.log_message(f"Selected: {after_select} features")
-                if after_select == 0:
-                    # Fallback: selecione só válidas
-                    loss_layer.selectByExpression(
-                        '"is_valid" = 1 AND "val" = 255')
-                    self.log_message("Fallback: All valid selected")
-                self.iface.layerTreeView().refreshLayerSymbology(loss_layer.id())
+                if not loss_layer or not loss_layer.isValid():
+                    self.log_message("⚠️ Loss layer is invalid or could not be loaded.")
+                else:
+                    total = _total_features_safe(loss_layer)
+                    self.log_message(f"📊 Layer diagnostics: Total features = {total}")
+                    if total == 0:
+                        self.log_message("⚠️ Loss layer has no features - skipping loss filter.")
+                    else:
+                        expression = expression_base + ' AND "val" = 255'
+                        loss_layer.removeSelection()
+                        loss_layer.selectByExpression(expression)
+                        self.log_message(
+                            f"Test expression: {expression} — Applied")
+                        after_select = loss_layer.selectedFeatureCount()
+                        self.log_message(f"Selected: {after_select} features")
+                        if after_select == 0:
+                            # Fallback: selecione só válidas
+                            loss_layer.selectByExpression(
+                                '"is_valid" = 1 AND "val" = 255')
+                            self.log_message("Fallback: All valid selected")
+                        try:
+                            self.iface.layerTreeView().refreshLayerSymbology(loss_layer.id())
+                        except Exception:
+                            pass
 
             self.log_message(
                 f"Filter applied: area>={min_area}, per>={min_per}, elong<={max_el}, rect>={min_rect}")
@@ -3432,6 +3767,16 @@ class UrbanChangeAid:
         """
         self.log_message(
             "🔍 Button clicked: Starting open_filtered_preview...")  # ← NOVO: Confirma clique
+
+        # Garantir que o diretório temp exista — previne erros como 'is not a directory'
+        try:
+            if not hasattr(self, 'temp_dir') or not self.temp_dir:
+                self.temp_dir = os.path.join(os.path.dirname(__file__), 'temp')
+            os.makedirs(self.temp_dir, exist_ok=True)
+            self.log_message(f"Using temp dir: {self.temp_dir}")
+        except Exception as e:
+            # Log e continua; operações que escrevem irão tratar erros explicitamente
+            self.log_message(f"Could not ensure temp dir: {e}")
 
         gain_layers = QgsProject.instance().mapLayersByName("Gain Vectors (with Metrics)")
         loss_layers = QgsProject.instance().mapLayersByName("Loss Vectors (with Metrics)")
@@ -3987,14 +4332,41 @@ class UrbanChangeAid:
         export_dir = QFileDialog.getExistingDirectory(
             self.dialog, "Export Filtered Selection")
         if export_dir:
-            if gain_layer.selectedFeatureCount() > 0:
-                processing.run("native:saveselectedfeatures", {
-                               'INPUT': gain_layer, 'OUTPUT': os.path.join(export_dir, "preview_gain.shp")})
-            if loss_layer.selectedFeatureCount() > 0:
-                processing.run("native:saveselectedfeatures", {
-                               'INPUT': loss_layer, 'OUTPUT': os.path.join(export_dir, "preview_loss.shp")})
-            QMessageBox.information(
-                self.dialog, "Success", f"Exported to {export_dir}")
+            def _write_layer_selected(layer, out_path):
+                try:
+                    if not layer or layer.selectedFeatureCount() == 0:
+                        return False
+                    writer = QgsVectorFileWriter(
+                        out_path, 'UTF-8', layer.fields(),
+                        layer.wkbType(), layer.crs(), "ESRI Shapefile"
+                    )
+                    if writer.hasError() != QgsVectorFileWriter.NoError:
+                        self.log_message(f"Failed to create writer for {out_path}: {writer.errorMessage()}")
+                        return False
+                    for feat in layer.selectedFeatures():
+                        writer.addFeature(feat)
+                    del writer
+                    return True
+                except Exception as e:
+                    self.log_message(f"Error exporting preview layer to {out_path}: {e}")
+                    return False
+
+            exported_any = False
+            if gain_layer and gain_layer.selectedFeatureCount() > 0:
+                outp = os.path.join(export_dir, "preview_gain.shp")
+                if _write_layer_selected(gain_layer, outp):
+                    exported_any = True
+                    self.log_message(f"Exported preview gain to {outp}")
+            if loss_layer and loss_layer.selectedFeatureCount() > 0:
+                outp = os.path.join(export_dir, "preview_loss.shp")
+                if _write_layer_selected(loss_layer, outp):
+                    exported_any = True
+                    self.log_message(f"Exported preview loss to {outp}")
+
+            if exported_any:
+                QMessageBox.information(self.dialog, "Success", f"Exported to {export_dir}")
+            else:
+                QMessageBox.information(self.dialog, "Info", "No features exported from preview.")
 
     def apply_smoothify(self):
         """Aplica o algoritmo Smoothify nos vetores de entrada, procurando de forma inteligente
@@ -4156,6 +4528,8 @@ class UrbanChangeAid:
                 return None, None
 
         try:
+            # Avoid ensuring temp dir here to prevent recursion with _ensure_temp_dir().
+            # Caller should ensure `self.temp_dir` when required. Just gather layers.
             gain_layers = QgsProject.instance().mapLayersByName("Gain Vectors (with Metrics)")
             loss_layers = QgsProject.instance().mapLayersByName("Loss Vectors (with Metrics)")
 
@@ -4168,16 +4542,31 @@ class UrbanChangeAid:
                     return False
 
                 if layer.selectedFeatureCount() == 0:
-                    if "Gain" in layer.name():
-                        layer.selectByExpression(
-                            '"is_valid" = 1 AND "val" = 255')
-                    else:
-                        layer.selectByExpression(
-                            '"is_valid" = 1 AND "val" = 0')
+                    # Try common 'val' values used in the plugin outputs (255 preferred)
+                    tried = []
+                    try:
+                        layer.selectByExpression('"is_valid" = 1 AND "val" = 255')
+                        tried.append('val=255')
+                    except Exception:
+                        pass
+                    if layer.selectedFeatureCount() == 0:
+                        try:
+                            layer.selectByExpression('"is_valid" = 1 AND "val" = 0')
+                            tried.append('val=0')
+                        except Exception:
+                            pass
+
+                if layer.selectedFeatureCount() == 0:
+                    # Final fallback: select only valid features
+                    try:
+                        layer.selectByExpression('"is_valid" = 1')
+                        tried.append('is_valid only')
+                    except Exception:
+                        pass
 
                 if layer.selectedFeatureCount() == 0:
                     self.log_message(
-                        f"No features to export for layer {layer.name()}.")
+                        f"No features to export for layer {layer.name()} (tried: {tried}).")
                     return False
 
                 writer = QgsVectorFileWriter(
@@ -4234,15 +4623,34 @@ class UrbanChangeAid:
                 QMessageBox.critical(self.dialog, "Error", error_msg)
             raise Exception(error_msg)
 
-    def _export_filtered_vectors_to_temp(self):
-        """Exporta os vetores filtrados para o diretório temporário do plugin."""
+
+
+    def _ensure_temp_dir(self):
+        """Ensure plugin temp directory exists and is writable. Raises on failure."""
+        if not hasattr(self, 'temp_dir') or not self.temp_dir:
+            self.temp_dir = os.path.join(os.path.dirname(__file__), 'temp')
+        try:
+            os.makedirs(self.temp_dir, exist_ok=True)
+        except Exception as e:
+            self.log_message(f"Could not create temp dir '{self.temp_dir}': {e}")
+            raise
+        # Check writability
+        try:
+            test_path = os.path.join(self.temp_dir, ".write_test")
+            with open(test_path, 'w') as f:
+                f.write('ok')
+            os.remove(test_path)
+        except Exception as e:
+            self.log_message(f"Temp dir not writable '{self.temp_dir}': {e}")
+            raise
+
+    def _export_filtered_vectors_to_temp_fixed(self):
+        """Exporta os vetores filtrados para o diretório temporário do plugin (lógica movida para cá)."""
         self.log_message(
             "Attempting to export filtered vectors to temp directory for Smoothify.")
-        temp_dir = self.temp_dir
-
         try:
             gain_output_path, loss_output_path = self.export_filtered_vectors(
-                export_dir=temp_dir, is_internal_call=True)
+                export_dir=self.temp_dir, is_internal_call=True)
 
             if gain_output_path and os.path.exists(gain_output_path):
                 self.filtered_gain_vector = gain_output_path
@@ -4258,13 +4666,16 @@ class UrbanChangeAid:
                 f"Filtered vectors exported to temp: Gain={self.filtered_gain_vector}, Loss={self.filtered_loss_vector}")
 
             if not self.filtered_gain_vector and not self.filtered_loss_vector:
-                raise Exception(
-                    "Export process completed, but no output files were generated.")
+                # Não levanta exceção aqui, apenas loga e permite que o processo continue
+                # se for o caso de não haver features filtradas.
+                self.log_message(
+                    "WARNING: Export process completed, but no output files were generated (no features to export).")
 
         except Exception as e:
             self.log_message(
-                f"Failed during _export_filtered_vectors_to_temp: {e}")
-            raise
+                f"Failed during _export_filtered_vectors_to_temp_fixed: {e}")
+            # Levanta a exceção para ser capturada por next_to_metrics
+            raise Exception(f"Temp dir error before computing metrics: {e}")
 
     def generate_centroids(self):
         """Gera centroides a partir dos vetores filtrados (gain/loss) e carrega no projeto.
